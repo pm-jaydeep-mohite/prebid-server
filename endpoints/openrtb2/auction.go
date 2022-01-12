@@ -286,6 +286,9 @@ func (deps *endpointDeps) parseRequest(httpRequest *http.Request) (req *openrtb_
 	if len(errs) > 0 {
 		return nil, nil, errs
 	}
+	storedAuctionResponses, errs := deps.processStoredAuctionResponses(ctx, impInfo)
+	//TODO: remove imp from request?
+	fmt.Print(storedAuctionResponses)
 
 	// Fetch the Stored Request data and merge it into the HTTP request.
 	if requestJson, impExtInfoMap, errs = deps.processStoredRequests(ctx, requestJson, impInfo); len(errs) > 0 {
@@ -1505,6 +1508,27 @@ func getJsonSyntaxError(testJSON []byte) (bool, string) {
 		return true, err
 	}
 	return false, ""
+}
+
+func (deps *endpointDeps) processStoredAuctionResponses(ctx context.Context, impInfo []ImpExtPrebidData) (map[string]json.RawMessage, []error) {
+	storedAuctionResponseIds := make([]string, 0, 0)
+	for index, impData := range impInfo {
+		if impData.ImpExtPrebid.StoredAuctionResponse != nil {
+			if len(impData.ImpExtPrebid.StoredAuctionResponse.ID) == 0 {
+				return nil, []error{fmt.Errorf("request.imp[%d] has  ext.prebid.storedauctionresponse specified, but \"id\" field is missing ", index)}
+			} else {
+				storedAuctionResponseIds = append(storedAuctionResponseIds, impData.ImpExtPrebid.StoredAuctionResponse.ID)
+			}
+		}
+	}
+	if len(storedAuctionResponseIds) > 0 {
+		storedAuctionResponses, errs := deps.storedRespFetcher.FetchResponses(ctx, storedAuctionResponseIds)
+		if len(errs) > 0 {
+			return nil, errs
+		}
+		return storedAuctionResponses, nil
+	}
+	return nil, nil
 }
 
 func (deps *endpointDeps) processStoredRequests(ctx context.Context, requestJson []byte, impInfo []ImpExtPrebidData) ([]byte, map[string]exchange.ImpExtInfo, []error) {
