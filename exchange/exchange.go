@@ -162,6 +162,8 @@ type AuctionRequest struct {
 	// in HoldAuction until we get to factoring it away. Do not use for anything new.
 	LegacyLabels   metrics.Labels
 	FirstPartyData map[openrtb_ext.BidderName]*firstpartydata.ResolvedFirstPartyData
+	// map of imp id to stored response
+	StoredAuctionResponses map[string]json.RawMessage
 }
 
 // BidderRequest holds the bidder specific request and all other
@@ -305,7 +307,7 @@ func (e *exchange) HoldAuction(ctx context.Context, r AuctionRequest, debugLog *
 	}
 
 	// Build the response
-	return e.buildBidResponse(ctx, liveAdapters, adapterBids, r.BidRequest, adapterExtra, auc, bidResponseExt, cacheInstructions.returnCreative, r.ImpExtInfoMap, errs)
+	return e.buildBidResponse(ctx, liveAdapters, adapterBids, r.BidRequest, adapterExtra, auc, bidResponseExt, cacheInstructions.returnCreative, r.ImpExtInfoMap, r.StoredAuctionResponses, errs)
 }
 
 func (e *exchange) parseGDPRDefaultValue(bidRequest *openrtb2.BidRequest) gdpr.Signal {
@@ -587,7 +589,7 @@ func errsToBidderWarnings(errs []error) []openrtb_ext.ExtBidderMessage {
 }
 
 // This piece takes all the bids supplied by the adapters and crafts an openRTB response to send back to the requester
-func (e *exchange) buildBidResponse(ctx context.Context, liveAdapters []openrtb_ext.BidderName, adapterBids map[openrtb_ext.BidderName]*pbsOrtbSeatBid, bidRequest *openrtb2.BidRequest, adapterExtra map[openrtb_ext.BidderName]*seatResponseExtra, auc *auction, bidResponseExt *openrtb_ext.ExtBidResponse, returnCreative bool, impExtInfoMap map[string]ImpExtInfo, errList []error) (*openrtb2.BidResponse, error) {
+func (e *exchange) buildBidResponse(ctx context.Context, liveAdapters []openrtb_ext.BidderName, adapterBids map[openrtb_ext.BidderName]*pbsOrtbSeatBid, bidRequest *openrtb2.BidRequest, adapterExtra map[openrtb_ext.BidderName]*seatResponseExtra, auc *auction, bidResponseExt *openrtb_ext.ExtBidResponse, returnCreative bool, impExtInfoMap map[string]ImpExtInfo, storedActionResponses map[string]json.RawMessage, errList []error) (*openrtb2.BidResponse, error) {
 	bidResponse := new(openrtb2.BidResponse)
 	var err error
 
@@ -595,6 +597,43 @@ func (e *exchange) buildBidResponse(ctx context.Context, liveAdapters []openrtb_
 	if len(liveAdapters) == 0 {
 		// signal "Invalid Request" if no valid bidders.
 		bidResponse.NBR = openrtb2.NoBidReasonCode.Ptr(openrtb2.NoBidReasonCodeInvalidRequest)
+	}
+
+	//process stored auction responses
+	//add liveadapters
+	//add adaprerbids
+	if len(storedActionResponses) > 0 {
+		for impId, storedResp := range storedActionResponses {
+			var seatBids []openrtb2.SeatBid
+
+			if err = json.Unmarshal(storedResp, &seatBids); err != nil {
+				return nil, err
+			}
+			for _, seat := range seatBids {
+				var bidsToAdd []*pbsOrtbBid
+				//set imp id from request
+				for _, bid := range seat.Bid {
+					bid.ImpID = impId
+					bidsToAdd = append(bidsToAdd, &pbsOrtbBid{bid: &bid})
+				}
+
+				bidderName := openrtb_ext.BidderName(seat.Seat)
+				if _, ok := adapterBids[bidderName]; ok {
+					//add stored resp to real bids for seat bid
+					adapterBids[bidderName].bids = append(adapterBids[bidderName].bids, bidsToAdd...)
+
+				} else {
+					//create new seat bid and add it to live adapters
+					liveAdapters = append(liveAdapters, bidderName)
+					newSeatBid := pbsOrtbSeatBid{bidsToAdd, "", nil}
+					adapterBids[bidderName] = &newSeatBid
+
+				}
+
+			}
+
+		}
+
 	}
 
 	// Create the SeatBids. We use a zero sized slice so that we can append non-zero seat bids, and not include seatBid
