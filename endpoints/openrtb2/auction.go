@@ -151,9 +151,6 @@ func (deps *endpointDeps) Auction(w http.ResponseWriter, r *http.Request, _ http
 	if errortypes.ContainsFatalError(errL) && writeError(errL, w, &labels) {
 		return
 	}
-	if req.Imp == nil && len(storedAuctionResponses) > 0 {
-		//TODO: skip to HoldAction?
-	}
 
 	resolvedFPD, fpdErrors := firstpartydata.ExtractFPDForBidders(req)
 	if len(fpdErrors) > 0 {
@@ -305,26 +302,6 @@ func (deps *endpointDeps) parseRequest(httpRequest *http.Request) (req *openrtb_
 		return
 	}
 
-	if len(storedAuctionResponses) > 0 {
-
-		if len(storedAuctionResponses) == len(req.Imp) {
-			req.Imp = nil
-			//no need to validate request, all imps have stored responses
-			return
-		}
-
-		//Remove imp with stored response from request
-		imps := make([]openrtb2.Imp, 0, 0)
-		for _, imp := range req.Imp {
-
-			//if imp is not present in storedAuctionResponses - return it back to request
-			if _, ok := storedAuctionResponses[imp.ID]; !ok {
-				imps = append(imps, imp)
-			}
-		}
-		req.Imp = imps
-	}
-
 	if err := mergeBidderParams(req); err != nil {
 		errs = []error{err}
 		return
@@ -340,7 +317,7 @@ func (deps *endpointDeps) parseRequest(httpRequest *http.Request) (req *openrtb_
 
 	lmt.ModifyForIOS(req.BidRequest)
 
-	errL := deps.validateRequest(req, false)
+	errL := deps.validateRequest(req, false, len(storedAuctionResponses) > 0)
 	if len(errL) > 0 {
 		errs = append(errs, errL...)
 	}
@@ -497,7 +474,7 @@ func addMissingReqExtParamsInImpExt(impExtByBidder map[string]json.RawMessage, r
 	return anyModified, nil
 }
 
-func (deps *endpointDeps) validateRequest(req *openrtb_ext.RequestWrapper, isAmp bool) []error {
+func (deps *endpointDeps) validateRequest(req *openrtb_ext.RequestWrapper, isAmp bool, hasStoredResponses bool) []error {
 	errL := []error{}
 	if req.ID == "" {
 		return []error{errors.New("request missing required field: \"id\"")}
@@ -608,7 +585,7 @@ func (deps *endpointDeps) validateRequest(req *openrtb_ext.RequestWrapper, isAmp
 			errL = append(errL, fmt.Errorf(`request.imp[%d].id and request.imp[%d].id are both "%s". Imp IDs must be unique.`, firstIndex, index, imp.ID))
 		}
 		impIDs[imp.ID] = index
-		errs := deps.validateImp(imp, aliases, index)
+		errs := deps.validateImp(imp, aliases, index, hasStoredResponses)
 		if len(errs) > 0 {
 			errL = append(errL, errs...)
 		}
@@ -698,7 +675,7 @@ func validateBidders(bidders []string, knownBidders map[string]openrtb_ext.Bidde
 	return nil
 }
 
-func (deps *endpointDeps) validateImp(imp *openrtb2.Imp, aliases map[string]string, index int) []error {
+func (deps *endpointDeps) validateImp(imp *openrtb2.Imp, aliases map[string]string, index int, hasStoredResponses bool) []error {
 	if imp.ID == "" {
 		return []error{fmt.Errorf("request.imp[%d] missing required field: \"id\"", index)}
 	}
@@ -731,7 +708,7 @@ func (deps *endpointDeps) validateImp(imp *openrtb2.Imp, aliases map[string]stri
 		return []error{err}
 	}
 
-	errL := deps.validateImpExt(imp, aliases, index)
+	errL := deps.validateImpExt(imp, aliases, index, hasStoredResponses)
 	if len(errL) != 0 {
 		return errL
 	}
@@ -1150,7 +1127,7 @@ func validatePmp(pmp *openrtb2.PMP, impIndex int) error {
 	return nil
 }
 
-func (deps *endpointDeps) validateImpExt(imp *openrtb2.Imp, aliases map[string]string, impIndex int) []error {
+func (deps *endpointDeps) validateImpExt(imp *openrtb2.Imp, aliases map[string]string, impIndex int, hasStoredResponses bool) []error {
 	errL := []error{}
 	if len(imp.Ext) == 0 {
 		return []error{fmt.Errorf("request.imp[%d].ext is required", impIndex)}
@@ -1163,8 +1140,8 @@ func (deps *endpointDeps) validateImpExt(imp *openrtb2.Imp, aliases map[string]s
 
 	// Prefer bidder params from request.imp.ext.prebid.bidder.BIDDER over request.imp.ext.BIDDER
 	// to avoid confusion beteween prebid specific adapter config and other ext protocols.
+	var extPrebid openrtb_ext.ExtImpPrebid
 	if extPrebidJSON, ok := bidderExts[openrtb_ext.PrebidExtKey]; ok {
-		var extPrebid openrtb_ext.ExtImpPrebid
 		if err := json.Unmarshal(extPrebidJSON, &extPrebid); err == nil && extPrebid.Bidder != nil {
 			for bidder, ext := range extPrebid.Bidder {
 				if ext == nil {
@@ -1173,6 +1150,9 @@ func (deps *endpointDeps) validateImpExt(imp *openrtb2.Imp, aliases map[string]s
 				bidderExts[bidder] = ext
 			}
 		}
+	}
+	if hasStoredResponses && (extPrebid.StoredAuctionResponse == nil || len(extPrebid.StoredAuctionResponse.ID) == 0) {
+		return []error{fmt.Errorf("request validation failed. The StoredAuctionResponse.ID field must be completely present with, or completely absent from, all impressions in request. No StoredAuctionResponse data found for request.imp[%d].ext.prebid \n", impIndex)}
 	}
 
 	/* Process all the bidder exts in the request */
