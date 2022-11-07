@@ -11,7 +11,8 @@ import (
 	"strings"
 
 	"github.com/buger/jsonparser"
-	"github.com/mxmCherry/openrtb/v15/openrtb2"
+	"github.com/prebid/openrtb/v17/adcom1"
+	"github.com/prebid/openrtb/v17/openrtb2"
 	"github.com/prebid/prebid-server/config"
 
 	"github.com/prebid/prebid-server/adapters"
@@ -308,9 +309,9 @@ func preprocess(imp *openrtb2.Imp, defaultDisplayManagerVer string) (string, boo
 	if imp.Banner != nil {
 		bannerCopy := *imp.Banner
 		if appnexusExt.Position == "above" {
-			bannerCopy.Pos = openrtb2.AdPositionAboveTheFold.Ptr()
+			bannerCopy.Pos = adcom1.PositionAboveFold.Ptr()
 		} else if appnexusExt.Position == "below" {
-			bannerCopy.Pos = openrtb2.AdPositionBelowTheFold.Ptr()
+			bannerCopy.Pos = adcom1.PositionBelowFold.Ptr()
 		}
 
 		// Fixes #307
@@ -452,7 +453,7 @@ func appendMemberId(uri string, memberId string) string {
 }
 
 // Builder builds a new instance of the AppNexus adapter for the given bidder with the given config.
-func Builder(bidderName openrtb_ext.BidderName, config config.Adapter) (adapters.Bidder, error) {
+func Builder(bidderName openrtb_ext.BidderName, config config.Adapter, server config.Server) (adapters.Bidder, error) {
 	bidder := &adapter{
 		URI:            config.Endpoint,
 		iabCategoryMap: loadCategoryMapFromFileSystem(),

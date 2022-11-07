@@ -5,57 +5,34 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/prebid/prebid-server/firstpartydata"
+	"github.com/buger/jsonparser"
+	"github.com/julienschmidt/httprouter"
+	"github.com/prebid/openrtb/v17/native1"
+	nativeRequests "github.com/prebid/openrtb/v17/native1/request"
+	"github.com/prebid/openrtb/v17/openrtb2"
+	"github.com/stretchr/testify/assert"
 
 	analyticsConf "github.com/prebid/prebid-server/analytics/config"
 	"github.com/prebid/prebid-server/config"
-	"github.com/prebid/prebid-server/currency"
 	"github.com/prebid/prebid-server/errortypes"
 	"github.com/prebid/prebid-server/exchange"
 	"github.com/prebid/prebid-server/metrics"
 	metricsConfig "github.com/prebid/prebid-server/metrics/config"
 	"github.com/prebid/prebid-server/openrtb_ext"
 	"github.com/prebid/prebid-server/stored_requests/backends/empty_fetcher"
+	"github.com/prebid/prebid-server/stored_responses"
 	"github.com/prebid/prebid-server/util/iputil"
-
-	"github.com/buger/jsonparser"
-	"github.com/mxmCherry/openrtb/v15/native1"
-	nativeRequests "github.com/mxmCherry/openrtb/v15/native1/request"
-	"github.com/mxmCherry/openrtb/v15/openrtb2"
-	"github.com/stretchr/testify/assert"
 )
-
-const maxSize = 1024 * 256
-
-type testCase struct {
-	BidRequest           json.RawMessage   `json:"mockBidRequest"`
-	Config               *testConfigValues `json:"config"`
-	ExpectedReturnCode   int               `json:"expectedReturnCode,omitempty"`
-	ExpectedErrorMessage string            `json:"expectedErrorMessage"`
-	ExpectedBidResponse  json.RawMessage   `json:"expectedBidResponse"`
-}
-
-type testConfigValues struct {
-	AccountRequired     bool                          `json:"accountRequired"`
-	AliasJSON           string                        `json:"aliases"`
-	BlacklistedAccounts []string                      `json:"blacklistedAccts"`
-	BlacklistedApps     []string                      `json:"blacklistedApps"`
-	DisabledAdapters    []string                      `json:"disabledAdapters"`
-	CurrencyRates       map[string]map[string]float64 `json:"currencyRates"`
-	MockBidder          mockBidExchangeBidder         `json:"mockBidder"`
-}
 
 func TestJsonSampleRequests(t *testing.T) {
 	testSuites := []struct {
@@ -81,6 +58,10 @@ func TestJsonSampleRequests(t *testing.T) {
 		{
 			"Makes sure we handle (default) aliased bidders properly",
 			"aliased",
+		},
+		{
+			"Asserts we return 500s on requests referencing accounts with malformed configs.",
+			"account-malformed",
 		},
 		{
 			"Asserts we return 503s on requests with blacklisted accounts and apps.",
@@ -123,45 +104,58 @@ func TestJsonSampleRequests(t *testing.T) {
 			"currency-conversion/custom-rates/errors",
 		},
 	}
-	for _, test := range testSuites {
-		testCaseFiles, err := getTestFiles(filepath.Join("sample-requests", test.sampleRequestsSubDir))
-		if assert.NoError(t, err, "Test case %s. Error reading files from directory %s \n", test.description, test.sampleRequestsSubDir) {
-			for _, file := range testCaseFiles {
-				data, err := ioutil.ReadFile(file)
-				if assert.NoError(t, err, "Test case %s. Error reading file %s \n", test.description, file) {
-					runTestCase(t, data, file)
+
+	for _, tc := range testSuites {
+		testCaseFiles, err := getTestFiles(filepath.Join("sample-requests", tc.sampleRequestsSubDir))
+		if assert.NoError(t, err, "Test case %s. Error reading files from directory %s \n", tc.description, tc.sampleRequestsSubDir) {
+			for _, testFile := range testCaseFiles {
+				fileData, err := ioutil.ReadFile(testFile)
+				if assert.NoError(t, err, "Test case %s. Error reading file %s \n", tc.description, testFile) {
+					// Retrieve test case input and expected output from JSON file
+					test, err := parseTestFile(fileData, testFile)
+					if !assert.NoError(t, err) {
+						continue
+					}
+
+					// Build endpoint for testing. If no error, run test case
+					cfg := &config.Configuration{MaxRequestSize: maxSize}
+					if test.Config != nil {
+						cfg.BlacklistedApps = test.Config.BlacklistedApps
+						cfg.BlacklistedAppMap = test.Config.getBlacklistedAppMap()
+						cfg.BlacklistedAccts = test.Config.BlacklistedAccounts
+						cfg.BlacklistedAcctMap = test.Config.getBlackListedAccountMap()
+						cfg.AccountRequired = test.Config.AccountRequired
+					}
+					cfg.MarshalAccountDefaults()
+					test.endpointType = OPENRTB_ENDPOINT
+
+					auctionEndpointHandler, _, mockBidServers, mockCurrencyRatesServer, err := buildTestEndpoint(test, cfg)
+					if assert.NoError(t, err) {
+						runTestCase(t, auctionEndpointHandler, test, fileData, testFile)
+					}
+
+					// Close servers regardless if the test case was run or not
+					for _, mockBidServer := range mockBidServers {
+						mockBidServer.Close()
+					}
+					mockCurrencyRatesServer.Close()
 				}
 			}
 		}
 	}
 }
 
-func getTestFiles(dir string) ([]string, error) {
-	var filesToAssert []string
-
-	fileList, err := ioutil.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	// Append the path of every file found in `dir` to the `filesToAssert` array
-	for _, fileInfo := range fileList {
-		filesToAssert = append(filesToAssert, filepath.Join(dir, fileInfo.Name()))
-	}
-
-	return filesToAssert, nil
-}
-
-func runTestCase(t *testing.T, fileData []byte, testFile string) {
+func runTestCase(t *testing.T, auctionEndpointHandler httprouter.Handle, test testCase, fileData []byte, testFile string) {
 	t.Helper()
 
-	// Retrieve values from JSON file
-	test := parseTestFile(t, fileData, testFile)
-
-	// Run test
-	actualCode, actualJsonBidResponse := doRequest(t, test)
+	// Hit the auction endpoint with the test case configuration and mockBidRequest
+	request := httptest.NewRequest("POST", "/openrtb2/auction", bytes.NewReader(test.BidRequest))
+	recorder := httptest.NewRecorder()
+	auctionEndpointHandler(recorder, request, nil)
 
 	// Assertions
+	actualCode := recorder.Code
+	actualJsonBidResponse := recorder.Body.String()
 	assert.Equal(t, test.ExpectedReturnCode, actualCode, "Test failed. Filename: %s \n", testFile)
 
 	// Either assert bid response or expected error
@@ -184,78 +178,6 @@ func runTestCase(t *testing.T, fileData []byte, testFile string) {
 	}
 }
 
-func parseTestFile(t *testing.T, fileData []byte, testFile string) testCase {
-	t.Helper()
-
-	parsedTestData := testCase{}
-	var err, errEm error
-
-	// Get testCase values
-	parsedTestData.BidRequest, _, _, err = jsonparser.Get(fileData, "mockBidRequest")
-	assert.NoError(t, err, "Error jsonparsing root.mockBidRequest from file %s. Desc: %v.", testFile, err)
-
-	// Get testCaseConfig values
-	parsedTestData.Config = &testConfigValues{}
-	var jsonTestConfig json.RawMessage
-
-	jsonTestConfig, _, _, err = jsonparser.Get(fileData, "config")
-	if err == nil {
-		err = json.Unmarshal(jsonTestConfig, parsedTestData.Config)
-		assert.NoError(t, err, "Error unmarshaling root.config from file %s. Desc: %v.", testFile, err)
-	}
-
-	// Get the return code we expect PBS to throw back given test's bidRequest and config
-	parsedReturnCode, err := jsonparser.GetInt(fileData, "expectedReturnCode")
-	assert.NoError(t, err, "Error jsonparsing root.code from file %s. Desc: %v.", testFile, err)
-
-	// Get both bid response and error message, if any
-	parsedTestData.ExpectedBidResponse, _, _, err = jsonparser.Get(fileData, "expectedBidResponse")
-	parsedTestData.ExpectedErrorMessage, errEm = jsonparser.GetString(fileData, "expectedErrorMessage")
-
-	assert.Falsef(t, (err == nil && errEm == nil), "Test case file can't have both a valid expectedBidResponse and a valid expectedErrorMessage, fields are mutually exclusive")
-	assert.Falsef(t, (err != nil && errEm != nil), "Test case file should come with either a valid expectedBidResponse or a valid expectedErrorMessage, not both.")
-
-	parsedTestData.ExpectedReturnCode = int(parsedReturnCode)
-
-	return parsedTestData
-}
-
-func (tc *testConfigValues) getBlacklistedAppMap() map[string]bool {
-	var blacklistedAppMap map[string]bool
-
-	if len(tc.BlacklistedApps) > 0 {
-		blacklistedAppMap = make(map[string]bool, len(tc.BlacklistedApps))
-		for _, app := range tc.BlacklistedApps {
-			blacklistedAppMap[app] = true
-		}
-	}
-	return blacklistedAppMap
-}
-
-func (tc *testConfigValues) getBlackListedAccountMap() map[string]bool {
-	var blacklistedAccountMap map[string]bool
-
-	if len(tc.BlacklistedAccounts) > 0 {
-		blacklistedAccountMap = make(map[string]bool, len(tc.BlacklistedAccounts))
-		for _, account := range tc.BlacklistedAccounts {
-			blacklistedAccountMap[account] = true
-		}
-	}
-	return blacklistedAccountMap
-}
-
-func (tc *testConfigValues) getAdaptersConfigMap() map[string]config.Adapter {
-	var adaptersConfig map[string]config.Adapter
-
-	if len(tc.DisabledAdapters) > 0 {
-		adaptersConfig = make(map[string]config.Adapter, len(tc.DisabledAdapters))
-		for _, adapterName := range tc.DisabledAdapters {
-			adaptersConfig[adapterName] = config.Adapter{Disabled: true}
-		}
-	}
-	return adaptersConfig
-}
-
 // Once unmarshalled, bidResponse objects can't simply be compared with an `assert.Equalf()` call
 // because tests fail if the elements inside the `bidResponse.SeatBid` and `bidResponse.SeatBid.Bid`
 // arrays, if any, are not listed in the exact same order in the actual version and in the expected version.
@@ -263,12 +185,10 @@ func assertBidResponseEqual(t *testing.T, testFile string, expectedBidResponse o
 
 	//Assert non-array BidResponse fields
 	assert.Equalf(t, expectedBidResponse.ID, actualBidResponse.ID, "BidResponse.ID doesn't match expected. Test: %s\n", testFile)
-	assert.Equalf(t, expectedBidResponse.BidID, actualBidResponse.BidID, "BidResponse.BidID doesn't match expected. Test: %s\n", testFile)
-	assert.Equalf(t, expectedBidResponse.NBR, actualBidResponse.NBR, "BidResponse.NBR doesn't match expected. Test: %s\n", testFile)
 	assert.Equalf(t, expectedBidResponse.Cur, actualBidResponse.Cur, "BidResponse.Cur doesn't match expected. Test: %s\n", testFile)
 
 	//Assert []SeatBid and their Bid elements independently of their order
-	assert.Len(t, actualBidResponse.SeatBid, len(expectedBidResponse.SeatBid), "BidResponse.SeatBid array doesn't match expected. Test: %s\n", testFile)
+	assert.Len(t, actualBidResponse.SeatBid, len(expectedBidResponse.SeatBid), "BidResponse.SeatBid is expected to contain %d elements but contains %d. Test: %s\n", len(expectedBidResponse.SeatBid), len(actualBidResponse.SeatBid), testFile)
 
 	//Given that bidResponses have the same length, compare them in an order-independent way using maps
 	var actualSeatBidsMap map[string]openrtb2.SeatBid = make(map[string]openrtb2.SeatBid, 0)
@@ -281,15 +201,36 @@ func assertBidResponseEqual(t *testing.T, testFile string, expectedBidResponse o
 		expectedSeatBidsMap[seatBid.Seat] = seatBid
 	}
 
-	for k, expectedSeatBid := range expectedSeatBidsMap {
-		//Assert non-array SeatBid fields
-		assert.Equalf(t, expectedSeatBid.Seat, actualSeatBidsMap[k].Seat, "actualSeatBidsMap[%s].Seat doesn't match expected. Test: %s\n", k, testFile)
-		assert.Equalf(t, expectedSeatBid.Group, actualSeatBidsMap[k].Group, "actualSeatBidsMap[%s].Group doesn't match expected. Test: %s\n", k, testFile)
-		assert.Equalf(t, expectedSeatBid.Ext, actualSeatBidsMap[k].Ext, "actualSeatBidsMap[%s].Ext doesn't match expected. Test: %s\n", k, testFile)
-		assert.Len(t, actualSeatBidsMap[k].Bid, len(expectedSeatBid.Bid), "BidResponse.SeatBid[].Bid array doesn't match expected. Test: %s\n", testFile)
+	for bidderName, expectedSeatBid := range expectedSeatBidsMap {
+		if !assert.Contains(t, actualSeatBidsMap, bidderName, "BidResponse.SeatBid[%s] was not found as expected. Test: %s\n", bidderName, testFile) {
+			continue
+		}
 
-		//Assert Bid arrays
-		assert.ElementsMatch(t, expectedSeatBid.Bid, actualSeatBidsMap[k].Bid, "BidResponse.SeatBid array doesn't match expected. Test: %s\n", testFile)
+		//Assert non-array SeatBid fields
+		assert.Equalf(t, expectedSeatBid.Seat, actualSeatBidsMap[bidderName].Seat, "actualSeatBidsMap[%s].Seat doesn't match expected. Test: %s\n", bidderName, testFile)
+		assert.Equalf(t, expectedSeatBid.Group, actualSeatBidsMap[bidderName].Group, "actualSeatBidsMap[%s].Group doesn't match expected. Test: %s\n", bidderName, testFile)
+		assert.Equalf(t, expectedSeatBid.Ext, actualSeatBidsMap[bidderName].Ext, "actualSeatBidsMap[%s].Ext doesn't match expected. Test: %s\n", bidderName, testFile)
+
+		// Assert Bid arrays
+		assert.Len(t, actualSeatBidsMap[bidderName].Bid, len(expectedSeatBid.Bid), "BidResponse.SeatBid[].Bid array is expected to contain %d elements but has %d. Test: %s\n", len(expectedSeatBid.Bid), len(actualSeatBidsMap[bidderName].Bid), testFile)
+		// Given that actualSeatBidsMap[bidderName].Bid and expectedSeatBid.Bid have the same length, compare them in an order-independent way using maps
+		var expectedBidMap map[string]openrtb2.Bid = make(map[string]openrtb2.Bid, 0)
+		for _, bid := range expectedSeatBid.Bid {
+			expectedBidMap[bid.ID] = bid
+		}
+
+		var actualBidMap map[string]openrtb2.Bid = make(map[string]openrtb2.Bid, 0)
+		for _, bid := range actualSeatBidsMap[bidderName].Bid {
+			actualBidMap[bid.ID] = bid
+		}
+
+		for bidID, expectedBid := range expectedBidMap {
+			if !assert.Contains(t, actualBidMap, bidID, "BidResponse.SeatBid[%s].Bid[%s].ID doesn't match expected. Test: %s\n", bidderName, bidID, testFile) {
+				continue
+			}
+			assert.Equalf(t, expectedBid.ImpID, actualBidMap[bidID].ImpID, "BidResponse.SeatBid[%s].Bid[%s].ImpID doesn't match expected. Test: %s\n", bidderName, bidID, testFile)
+			assert.Equalf(t, expectedBid.Price, actualBidMap[bidID].Price, "BidResponse.SeatBid[%s].Bid[%s].Price doesn't match expected. Test: %s\n", bidderName, bidID, testFile)
+		}
 	}
 }
 
@@ -429,7 +370,7 @@ func TestExplicitUserId(t *testing.T) {
 	endpoint, _ := NewEndpoint(
 		fakeUUIDGenerator{},
 		ex,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		cfg,
@@ -455,58 +396,6 @@ func TestExplicitUserId(t *testing.T) {
 	}
 }
 
-func doRequest(t *testing.T, test testCase) (int, string) {
-	bidderInfos := getBidderInfos(test.Config.getAdaptersConfigMap(), openrtb_ext.CoreBidderNames())
-	bidderMap := exchange.GetActiveBidders(bidderInfos)
-	disabledBidders := exchange.GetDisabledBiddersErrorMessages(bidderInfos)
-
-	mockExchange := newMockBidExchange(test.Config.MockBidder, test.Config.CurrencyRates)
-
-	endpoint, _ := NewEndpoint(
-		fakeUUIDGenerator{},
-		mockExchange,
-		newParamsValidator(t),
-		&mockStoredReqFetcher{},
-		empty_fetcher.EmptyFetcher{},
-		&config.Configuration{
-			MaxRequestSize:     maxSize,
-			BlacklistedApps:    test.Config.BlacklistedApps,
-			BlacklistedAppMap:  test.Config.getBlacklistedAppMap(),
-			BlacklistedAccts:   test.Config.BlacklistedAccounts,
-			BlacklistedAcctMap: test.Config.getBlackListedAccountMap(),
-			AccountRequired:    test.Config.AccountRequired,
-		},
-		&metricsConfig.NilMetricsEngine{},
-		analyticsConf.NewPBSAnalytics(&config.Analytics{}),
-		disabledBidders,
-		[]byte(test.Config.AliasJSON),
-		bidderMap,
-		empty_fetcher.EmptyFetcher{})
-
-	request := httptest.NewRequest("POST", "/openrtb2/auction", bytes.NewReader(test.BidRequest))
-	recorder := httptest.NewRecorder()
-	endpoint(recorder, request, nil) //Request comes from the unmarshalled mockBidRequest
-	return recorder.Code, recorder.Body.String()
-}
-
-// fetchFiles returns a list of the files from dir, or fails the test if an error occurs.
-func fetchFiles(t *testing.T, dir string) []os.FileInfo {
-	t.Helper()
-	requestFiles, err := ioutil.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("Failed to read folder: %s", dir)
-	}
-	return requestFiles
-}
-
-func readFile(t *testing.T, filename string) []byte {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		t.Fatalf("Failed to read file %s: %v", filename, err)
-	}
-	return data
-}
-
 // TestBadAliasRequests() reuses two requests that would fail anyway.  Here, we
 // take advantage of our knowledge that processStoredRequests() in auction.go
 // processes aliases before it processes stored imps.  Changing that order
@@ -525,9 +414,8 @@ func doBadAliasRequest(t *testing.T, filename string, expectMsg string) {
 
 	// aliasJSON lacks a comma after the "appnexus" entry so is bad JSON
 	aliasJSON := []byte(`{"ext":{"prebid":{"aliases": {"test1": "appnexus" "test2": "rubicon", "test3": "openx"}}}}`)
-	adaptersConfigs := make(map[string]config.Adapter)
 
-	bidderInfos := getBidderInfos(adaptersConfigs, openrtb_ext.CoreBidderNames())
+	bidderInfos := getBidderInfos(nil, openrtb_ext.CoreBidderNames())
 
 	bidderMap := exchange.GetActiveBidders(bidderInfos)
 	disabledBidders := exchange.GetDisabledBiddersErrorMessages(bidderInfos)
@@ -537,7 +425,7 @@ func doBadAliasRequest(t *testing.T, filename string, expectMsg string) {
 	endpoint, _ := NewEndpoint(
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		&config.Configuration{MaxRequestSize: maxSize},
@@ -589,7 +477,7 @@ func TestNilExchange(t *testing.T) {
 	_, err := NewEndpoint(
 		fakeUUIDGenerator{},
 		nil,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		&config.Configuration{MaxRequestSize: maxSize},
@@ -634,7 +522,7 @@ func TestExchangeError(t *testing.T) {
 	endpoint, _ := NewEndpoint(
 		fakeUUIDGenerator{},
 		&brokenExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		&config.Configuration{MaxRequestSize: maxSize},
@@ -658,7 +546,7 @@ func TestExchangeError(t *testing.T) {
 func TestUserAgentSetting(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(validRequest(t, "site.json")))
 	httpReq.Header.Set("User-Agent", "foo")
-	bidReq := &openrtb2.BidRequest{}
+	bidReq := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{}}
 
 	setUAImplicitly(httpReq, bidReq)
 
@@ -674,11 +562,11 @@ func TestUserAgentSetting(t *testing.T) {
 func TestUserAgentOverride(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(validRequest(t, "site.json")))
 	httpReq.Header.Set("User-Agent", "foo")
-	bidReq := &openrtb2.BidRequest{
+	bidReq := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{
 		Device: &openrtb2.Device{
 			UA: "bar",
 		},
-	}
+	}}
 
 	setUAImplicitly(httpReq, bidReq)
 
@@ -688,7 +576,7 @@ func TestUserAgentOverride(t *testing.T) {
 }
 
 func TestAuctionTypeDefault(t *testing.T) {
-	bidReq := &openrtb2.BidRequest{}
+	bidReq := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{}}
 	setAuctionTypeImplicitly(bidReq)
 
 	if bidReq.AT != 1 {
@@ -758,7 +646,7 @@ func TestImplicitIPsEndToEnd(t *testing.T) {
 		endpoint, _ := NewEndpoint(
 			fakeUUIDGenerator{},
 			exchange,
-			newParamsValidator(t),
+			mockBidderParamValidator{},
 			&mockStoredReqFetcher{},
 			empty_fetcher.EmptyFetcher{},
 			cfg,
@@ -901,8 +789,9 @@ func TestImplicitDNT(t *testing.T) {
 	for _, test := range testCases {
 		httpReq := httptest.NewRequest("POST", "/openrtb2/auction", nil)
 		httpReq.Header.Set("DNT", test.dntHeader)
-		setDoNotTrackImplicitly(httpReq, &test.request)
-		assert.Equal(t, test.expectedRequest, test.request)
+		reqWrapper := &openrtb_ext.RequestWrapper{BidRequest: &test.request}
+		setDoNotTrackImplicitly(httpReq, reqWrapper)
+		assert.Equal(t, test.expectedRequest, *reqWrapper.BidRequest, test.description)
 	}
 }
 
@@ -954,7 +843,7 @@ func TestImplicitDNTEndToEnd(t *testing.T) {
 		endpoint, _ := NewEndpoint(
 			fakeUUIDGenerator{},
 			exchange,
-			newParamsValidator(t),
+			mockBidderParamValidator{},
 			&mockStoredReqFetcher{},
 			empty_fetcher.EmptyFetcher{},
 			&config.Configuration{MaxRequestSize: maxSize},
@@ -980,13 +869,15 @@ func TestImplicitDNTEndToEnd(t *testing.T) {
 
 func TestImplicitSecure(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(validRequest(t, "site.json")))
-	httpReq.Header.Set(http.CanonicalHeaderKey("X-Forwarded-Proto"), "https")
+	httpReq.Header.Set("X-Forwarded-Proto", "https")
 
-	imps := []openrtb2.Imp{
-		{},
-		{},
+	imps := []*openrtb_ext.ImpWrapper{
+		{Imp: &openrtb2.Imp{}},
+		{Imp: &openrtb2.Imp{}},
 	}
+
 	setImpsImplicitly(httpReq, imps)
+
 	for _, imp := range imps {
 		if imp.Secure == nil || *imp.Secure != 1 {
 			t.Errorf("imp.Secure should be set to 1 if the request is https. Got %#v", imp.Secure)
@@ -994,22 +885,65 @@ func TestImplicitSecure(t *testing.T) {
 	}
 }
 
-func TestRefererParsing(t *testing.T) {
-	httpReq := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(validRequest(t, "site.json")))
-	httpReq.Header.Set("Referer", "http://test.mysite.com")
-	bidReq := &openrtb2.BidRequest{}
-
-	setSiteImplicitly(httpReq, bidReq)
-
-	if bidReq.Site == nil {
-		t.Fatalf("bidrequest.site should not be nil.")
+func TestReferer(t *testing.T) {
+	testCases := []struct {
+		description     string
+		givenSitePage   string
+		givenSiteDomain string
+		givenReferer    string
+		expectedDomain  string
+		expectedPage    string
+	}{
+		{
+			description:    "site.page/domain are unchanged when site.page/domain and http referer are not set",
+			expectedDomain: "",
+			expectedPage:   "",
+		},
+		{
+			description:    "site.page/domain are derived from referer when neither is set and http referer is set",
+			givenReferer:   "https://test.somepage.com",
+			expectedDomain: "somepage.com",
+			expectedPage:   "https://test.somepage.com",
+		},
+		{
+			description:    "site.domain is derived from site.page when site.page is set and http referer is not set",
+			givenSitePage:  "https://test.somepage.com",
+			expectedDomain: "somepage.com",
+			expectedPage:   "https://test.somepage.com",
+		},
+		{
+			description:    "site.domain is derived from http referer when site.page and http referer are set",
+			givenSitePage:  "https://test.somepage.com",
+			givenReferer:   "http://test.com",
+			expectedDomain: "test.com",
+			expectedPage:   "https://test.somepage.com",
+		},
+		{
+			description:     "site.page/domain are unchanged when site.page/domain and http referer are set",
+			givenSitePage:   "https://test.somepage.com",
+			givenSiteDomain: "some.domain.com",
+			givenReferer:    "http://test.com",
+			expectedDomain:  "some.domain.com",
+			expectedPage:    "https://test.somepage.com",
+		},
 	}
 
-	if bidReq.Site.Domain != "mysite.com" {
-		t.Errorf("Bad bidrequest.site.domain. Expected mysite.com, got %s", bidReq.Site.Domain)
-	}
-	if bidReq.Site.Page != "http://test.mysite.com" {
-		t.Errorf("Bad bidrequest.site.page. Expected mysite.com, got %s", bidReq.Site.Page)
+	for _, test := range testCases {
+		httpReq := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(validRequest(t, "site.json")))
+		httpReq.Header.Set("Referer", test.givenReferer)
+
+		bidReq := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{
+			Site: &openrtb2.Site{
+				Domain: test.givenSiteDomain,
+				Page:   test.givenSitePage,
+			},
+		}}
+
+		setSiteImplicitly(httpReq, bidReq)
+
+		assert.NotNil(t, bidReq.Site, test.description)
+		assert.Equal(t, test.expectedDomain, bidReq.Site.Domain, test.description)
+		assert.Equal(t, test.expectedPage, bidReq.Site.Page, test.description)
 	}
 }
 
@@ -1032,6 +966,10 @@ func TestParseImpInfoSingleImpression(t *testing.T) {
 			//in this case impression doesn't have storedrequest so we don't expect any data about this imp will be returned
 			Imp:          json.RawMessage(`{"id": "some-static-imp","video":{"mimes":["video/mp4"]},"ext": {"appnexus": {"placementId": "abc","position": "below"}}}`),
 			ImpExtPrebid: openrtb_ext.ExtImpPrebid{},
+		},
+		{
+			Imp:          json.RawMessage(`{"id":"my-imp-id", "video":{"h":300, "w":200}, "ext":{"prebid":{"storedrequest": {"id": "6"}}}}`),
+			ImpExtPrebid: openrtb_ext.ExtImpPrebid{StoredRequest: &openrtb_ext.ExtStoredRequest{ID: "6"}},
 		},
 	}
 
@@ -1109,7 +1047,7 @@ func TestStoredRequests(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -1126,7 +1064,7 @@ func TestStoredRequests(t *testing.T) {
 		empty_fetcher.EmptyFetcher{},
 	}
 
-	testStoreVideoAttr := []bool{true, true, false, false}
+	testStoreVideoAttr := []bool{true, true, false, false, false}
 
 	for i, requestData := range testStoredRequests {
 		impInfo, errs := parseImpInfo([]byte(requestData))
@@ -1142,7 +1080,6 @@ func TestStoredRequests(t *testing.T) {
 			}
 		}
 		expectJson := json.RawMessage(testFinalRequests[i])
-
 		assert.JSONEq(t, string(expectJson), string(newRequest), "Incorrect result request %d", i)
 
 		expectedImp := testStoredImpIds[i]
@@ -1271,190 +1208,217 @@ func TestMergeBidderParams(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		actualErr := mergeBidderParams(&openrtb_ext.RequestWrapper{BidRequest: &test.givenRequest})
+		w := &openrtb_ext.RequestWrapper{BidRequest: &test.givenRequest}
+		actualErr := mergeBidderParams(w)
 
 		// errors are only possible from the marshal operation, which is not testable
 		assert.NoError(t, actualErr, test.description+":err")
+
+		// rebuild request before asserting value
+		assert.NoError(t, w.RebuildRequest(), test.description+":rebuild_request")
 
 		assert.Equal(t, test.givenRequest.Imp, test.expectedRequestImps, test.description+":imps")
 	}
 }
 
-func TestAddMissingReqExtParamsInImpExtPrebid(t *testing.T) {
+func TestMergeBidderParamsImpExt(t *testing.T) {
 	testCases := []struct {
-		description            string
-		givenImpExtByBidder    map[string]json.RawMessage
-		givenReqExtParams      map[string]map[string]json.RawMessage
-		expectedModified       bool
-		expectedImpExtByBidder map[string]json.RawMessage
+		description       string
+		givenImpExt       map[string]json.RawMessage
+		givenReqExtParams map[string]map[string]json.RawMessage
+		expectedModified  bool
+		expectedImpExt    map[string]json.RawMessage
 	}{
 		{
-			description:            "No Prebid Section",
-			givenImpExtByBidder:    map[string]json.RawMessage{},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{},
+			description:       "One Bidder - Modified (no collision)",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:  true,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
 		},
 		{
-			description:            "Malformed Prebid Section",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`malformed`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`malformed`)},
+			description:       "One Bidder - Modified (imp.ext bidder empty)",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": json.RawMessage(`{}`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:  true,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"b":2}`)},
 		},
 		{
-			description:            "No Prebid Bidder Section",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{}`)},
+			description:       "One Bidder - Not Modified (imp.ext bidder not defined)",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"bidder-not-defined": {"b": json.RawMessage(`4`)}},
+			expectedModified:  false,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
 		},
 		{
-			description:            "Malformed Prebid Bidder Section",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder": malformed}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder": malformed}`)},
+			description:       "One Bidder - Not Modified (imp.ext bidder nil)",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": nil},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`4`)}},
+			expectedModified:  false,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": nil},
 		},
 		{
-			description:            "One Bidder - Modified (no collision)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1}}}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       true,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1,"b":2}}}`)},
+			description:       "One Bidder - Not Modified (imp.ext wins)",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`4`)}},
+			expectedModified:  false,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
 		},
 		{
-			description:            "One Bidder - Not Modified (imp.ext wins)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1,"b":2}}}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`4`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1,"b":2}}}`)},
+			description:       "One Bidder - Not Modified (reserved bidder ignored)",
+			givenImpExt:       map[string]json.RawMessage{"gpid": json.RawMessage(`{"a":1}`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"gpid": {"b": json.RawMessage(`2`)}},
+			expectedModified:  false,
+			expectedImpExt:    map[string]json.RawMessage{"gpid": json.RawMessage(`{"a":1}`)},
 		},
 		{
-			description:            "One Bidder - Not Modified (reserved bidder ignored)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"gpid":{"a":1}}}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"gpid": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"gpid":{"a":1}}}`)},
+			description:       "One Bidder - Not Modified (reserved bidder ignored - not embedded object)",
+			givenImpExt:       map[string]json.RawMessage{"gpid": json.RawMessage(`1`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"gpid": {"b": json.RawMessage(`2`)}},
+			expectedModified:  false,
+			expectedImpExt:    map[string]json.RawMessage{"gpid": json.RawMessage(`1`)},
 		},
 		{
-			description:            "One Bidder - Not Modified (reserved bidder ignored - not embedded object)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"gpid":1}}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"gpid": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"gpid":1}}`)},
+			description:       "One Bidder - Not Modified (malformed ignored)",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": json.RawMessage(`malformed`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:  false,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": json.RawMessage(`malformed`)},
 		},
 		{
-			description:            "One Bidder - Not Modified (malformed ignored)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":malformed}}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":malformed}}`)},
+			description:       "Multiple Bidders - Mixed",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}, "bidder2": {"b": json.RawMessage(`"three"`)}},
+			expectedModified:  true,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
 		},
 		{
-			description:            "Multiple Bidders - Mixed",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1},"bidder2":{"a":"one","b":"two"}}}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}, "bidder2": {"b": json.RawMessage(`"three"`)}},
-			expectedModified:       true,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1,"b":2},"bidder2":{"a":"one","b":"two"}}}`)},
-		},
-		{
-			description:            "Multiple Bidders - None Modified",
-			givenImpExtByBidder:    map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1},"bidder2":{"a":"one","b":"two"}}}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"prebid": json.RawMessage(`{"bidder":{"bidder1":{"a":1},"bidder2":{"a":"one","b":"two"}}}`)},
+			description:       "Multiple Bidders - None Modified",
+			givenImpExt:       map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
+			givenReqExtParams: map[string]map[string]json.RawMessage{},
+			expectedModified:  false,
+			expectedImpExt:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
 		},
 	}
 
 	for _, test := range testCases {
-		actualModified, actualErr := addMissingReqExtParamsInImpExtPrebid(test.givenImpExtByBidder, test.givenReqExtParams)
+		impExt := openrtb_ext.CreateImpExtForTesting(test.givenImpExt, nil)
+
+		err := mergeBidderParamsImpExt(&impExt, test.givenReqExtParams)
 
 		// errors are only possible from the marshal operation, which is not testable
-		assert.NoError(t, actualErr, test.description+":err")
+		assert.NoError(t, err, test.description+":err")
 
-		assert.Equal(t, test.expectedModified, actualModified, test.description+":modified")
-		assert.Equal(t, test.expectedImpExtByBidder, test.givenImpExtByBidder, test.description+":imp.ext")
+		assert.Equal(t, test.expectedModified, impExt.Dirty(), test.description+":modified")
+		assert.Equal(t, test.expectedImpExt, impExt.GetExt(), test.description+":imp.ext")
 	}
 }
 
-func TestAddMissingReqExtParamsInImpExt(t *testing.T) {
+func TestMergeBidderParamsImpExtPrebid(t *testing.T) {
 	testCases := []struct {
-		description            string
-		givenImpExtByBidder    map[string]json.RawMessage
-		givenReqExtParams      map[string]map[string]json.RawMessage
-		expectedModified       bool
-		expectedImpExtByBidder map[string]json.RawMessage
+		description          string
+		givenImpExtPrebid    *openrtb_ext.ExtImpPrebid
+		givenReqExtParams    map[string]map[string]json.RawMessage
+		expectedModified     bool
+		expectedImpExtPrebid *openrtb_ext.ExtImpPrebid
 	}{
 		{
-			description:            "One Bidder - Modified (no collision)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       true,
-			expectedImpExtByBidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
+			description:          "No Prebid Section",
+			givenImpExtPrebid:    nil,
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:     false,
+			expectedImpExtPrebid: nil,
 		},
 		{
-			description:            "One Bidder - Not Modified (imp.ext wins)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`4`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)},
+			description:          "No Prebid Bidder Section",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: nil},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:     false,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: nil},
 		},
 		{
-			description:            "One Bidder - Not Modified (reserved bidder ignored)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"gpid": json.RawMessage(`{"a":1}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"gpid": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"gpid": json.RawMessage(`{"a":1}`)},
+			description:          "Empty Prebid Bidder Section",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:     false,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{}},
 		},
 		{
-			description:            "One Bidder - Not Modified (reserved bidder ignored - not embedded object)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"gpid": json.RawMessage(`1`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"gpid": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"gpid": json.RawMessage(`1`)},
+			description:          "One Bidder - Modified (no collision)",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`)}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:     true,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)}},
 		},
 		{
-			description:            "One Bidder - Not Modified (malformed ignored)",
-			givenImpExtByBidder:    map[string]json.RawMessage{"bidder1": json.RawMessage(`malformed`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`malformed`)},
+			description:          "One Bidder - Modified (imp.ext bidder empty)",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{}`)}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:     true,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"b":2}`)}},
 		},
 		{
-			description:            "Multiple Bidders - Mixed",
-			givenImpExtByBidder:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}, "bidder2": {"b": json.RawMessage(`"three"`)}},
-			expectedModified:       true,
-			expectedImpExtByBidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
+			description:          "One Bidder - Not Modified (imp.ext wins)",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`4`)}},
+			expectedModified:     false,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)}},
 		},
 		{
-			description:            "Multiple Bidders - None Modified",
-			givenImpExtByBidder:    map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
-			givenReqExtParams:      map[string]map[string]json.RawMessage{},
-			expectedModified:       false,
-			expectedImpExtByBidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)},
+			description:          "One Bidder - Not Modified (imp.ext bidder not defined)",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder-not-defined": {"b": json.RawMessage(`4`)}},
+			expectedModified:     false,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`)}},
+		},
+		{
+			description:          "One Bidder - Not Modified (imp.ext bidder nil)",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": nil}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`4`)}},
+			expectedModified:     false,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": nil}},
+		},
+		{
+			description:          "One Bidder - Not Modified (malformed ignored)",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`malformed`)}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}},
+			expectedModified:     false,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`malformed`)}},
+		},
+		{
+			description:          "Multiple Bidders - Mixed",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{"bidder1": {"b": json.RawMessage(`2`)}, "bidder2": {"b": json.RawMessage(`"three"`)}},
+			expectedModified:     true,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1,"b":2}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)}},
+		},
+		{
+			description:          "Multiple Bidders - None Modified",
+			givenImpExtPrebid:    &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)}},
+			givenReqExtParams:    map[string]map[string]json.RawMessage{},
+			expectedModified:     false,
+			expectedImpExtPrebid: &openrtb_ext.ExtImpPrebid{Bidder: map[string]json.RawMessage{"bidder1": json.RawMessage(`{"a":1}`), "bidder2": json.RawMessage(`{"a":"one","b":"two"}`)}},
 		},
 	}
 
 	for _, test := range testCases {
-		actualModified, actualErr := addMissingReqExtParamsInImpExt(test.givenImpExtByBidder, test.givenReqExtParams)
+		impExt := openrtb_ext.CreateImpExtForTesting(map[string]json.RawMessage{}, test.givenImpExtPrebid)
+
+		err := mergeBidderParamsImpExtPrebid(&impExt, test.givenReqExtParams)
 
 		// errors are only possible from the marshal operation, which is not testable
-		assert.NoError(t, actualErr, test.description+":err")
+		assert.NoError(t, err, test.description+":err")
 
-		assert.Equal(t, test.expectedModified, actualModified, test.description+":modified")
-		assert.Equal(t, test.expectedImpExtByBidder, test.givenImpExtByBidder, test.description+":imp.ext")
+		assert.Equal(t, test.expectedModified, impExt.Dirty(), test.description+":modified")
+		assert.Equal(t, test.expectedImpExtPrebid, impExt.GetPrebid(), test.description+":imp.ext.prebid")
 	}
 }
-
-//impExtByBidder map[string]json.RawMessage, reqExtParams map[string]map[string]json.RawMessage) (bool, error) {
 
 func TestValidateRequest(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -1540,6 +1504,68 @@ func TestValidateRequest(t *testing.T) {
 			expectedErrorList: []error{errors.New("ext.prebid.channel.name can't be empty")},
 		},
 		{
+			description: "AliasGVLID validation error",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus":{"placementId": 12345678}}`),
+						},
+					},
+					Ext: []byte(`{"prebid":{"aliases":{"brightroll":"appnexus"}, "aliasgvlids":{"pubmatic1":1}}}`),
+				},
+			},
+			givenIsAmp:            false,
+			expectedErrorList:     []error{errors.New("request.ext.prebid.aliasgvlids. vendorId 1 refers to unknown bidder alias: pubmatic1")},
+			expectedChannelObject: &openrtb_ext.ExtRequestPrebidChannel{Name: appChannel, Version: ""},
+		},
+		{
+			description: "AliasGVLID validation error as vendorID < 1",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus":{"placementId": 12345678}}`),
+						},
+					},
+					Ext: []byte(`{"prebid":{"aliases":{"brightroll":"appnexus"}, "aliasgvlids":{"brightroll":0}}}`),
+				},
+			},
+			givenIsAmp:            false,
+			expectedErrorList:     []error{errors.New("request.ext.prebid.aliasgvlids. Invalid vendorId 0 for alias: brightroll. Choose a different vendorId, or remove this entry.")},
+			expectedChannelObject: &openrtb_ext.ExtRequestPrebidChannel{Name: appChannel, Version: ""},
+		},
+		{
 			description: "No errors in bid request with request.ext.prebid but no channel info, expect validate request to throw no errors and fill channel with app",
 			givenRequestWrapper: &openrtb_ext.RequestWrapper{
 				BidRequest: &openrtb2.BidRequest{
@@ -1563,7 +1589,7 @@ func TestValidateRequest(t *testing.T) {
 							Ext: []byte(`{"appnexus":{"placementId": 12345678}}`),
 						},
 					},
-					Ext: []byte(`{"prebid":{}}`),
+					Ext: []byte(`{"prebid":{"aliases":{"brightroll":"appnexus"}, "aliasgvlids":{"brightroll":1}}}`),
 				},
 			},
 			givenIsAmp:            false,
@@ -1573,7 +1599,7 @@ func TestValidateRequest(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		errorList := deps.validateRequest(test.givenRequestWrapper, test.givenIsAmp)
+		errorList := deps.validateRequest(test.givenRequestWrapper, test.givenIsAmp, false, nil)
 		assert.Equalf(t, test.expectedErrorList, errorList, "Error doesn't match: %s\n", test.description)
 
 		if len(errorList) == 0 {
@@ -1582,6 +1608,75 @@ func TestValidateRequest(t *testing.T) {
 			requestPrebid := requestExt.GetPrebid()
 
 			assert.Equalf(t, test.expectedChannelObject, requestPrebid.Channel, "Channel information isn't correct: %s\n", test.description)
+		}
+	}
+}
+
+func TestValidateRequestExt(t *testing.T) {
+	testCases := []struct {
+		description     string
+		givenRequestExt json.RawMessage
+		expectedError   string
+	}{
+		{
+			description:     "nil",
+			givenRequestExt: nil,
+		},
+		{
+			description:     "empty",
+			givenRequestExt: json.RawMessage(`{}`),
+		},
+		{
+			description:     "prebid - empty",
+			givenRequestExt: json.RawMessage(`{"prebid": {}}`),
+		},
+		{
+			description:     "prebid cache - empty",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {}}}`),
+			expectedError:   `request.ext is invalid: request.ext.prebid.cache requires one of the "bids" or "vastxml" properties`,
+		},
+		{
+			description:     "prebid cache - bids - null",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {"bids": null}}}`),
+			expectedError:   `request.ext is invalid: request.ext.prebid.cache requires one of the "bids" or "vastxml" properties`,
+		},
+		{
+			description:     "prebid cache - bids - wrong type",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {"bids": true}}}`),
+			expectedError:   `json: cannot unmarshal bool into Go struct field ExtRequestPrebidCache.cache.bids of type openrtb_ext.ExtRequestPrebidCacheBids`,
+		},
+		{
+			description:     "prebid cache - bids - provided",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {"bids": {}}}}`),
+		},
+		{
+			description:     "prebid cache - vastxml - null",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {"vastxml": null}}}`),
+			expectedError:   `request.ext is invalid: request.ext.prebid.cache requires one of the "bids" or "vastxml" properties`,
+		},
+		{
+			description:     "prebid cache - vastxml - wrong type",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {"vastxml": true}}}`),
+			expectedError:   `json: cannot unmarshal bool into Go struct field ExtRequestPrebidCache.cache.vastxml of type openrtb_ext.ExtRequestPrebidCacheVAST`,
+		},
+		{
+			description:     "prebid cache - vastxml - provided",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {"vastxml": {}}}}`),
+		},
+		{
+			description:     "prebid cache - bids + vastxml - provided",
+			givenRequestExt: json.RawMessage(`{"prebid": {"cache": {"bids": {}, "vastxml": {}}}}`),
+		},
+	}
+
+	for _, test := range testCases {
+		w := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{Ext: test.givenRequestExt}}
+		err := validateRequestExt(w)
+
+		if len(test.expectedError) > 0 {
+			assert.EqualError(t, err, test.expectedError, test.description)
+		} else {
+			assert.NoError(t, err, test.description)
 		}
 	}
 }
@@ -1691,13 +1786,75 @@ func TestValidateOrFillChannel(t *testing.T) {
 	}
 }
 
+func TestSetIntegrationType(t *testing.T) {
+	deps := &endpointDeps{
+		fakeUUIDGenerator{},
+		&nobidExchange{},
+		mockBidderParamValidator{},
+		&mockStoredReqFetcher{},
+		empty_fetcher.EmptyFetcher{},
+		empty_fetcher.EmptyFetcher{},
+		&config.Configuration{},
+		&metricsConfig.NilMetricsEngine{},
+		analyticsConf.NewPBSAnalytics(&config.Analytics{}),
+		map[string]string{},
+		false,
+		[]byte{},
+		openrtb_ext.BuildBidderMap(),
+		nil,
+		nil,
+		hardcodedResponseIPValidator{response: true},
+		empty_fetcher.EmptyFetcher{},
+	}
+
+	testCases := []struct {
+		description             string
+		givenRequestWrapper     *openrtb_ext.RequestWrapper
+		givenAccount            *config.Account
+		expectedIntegrationType string
+	}{
+		{
+			description: "Request has integration type defined, expect that same integration type",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{Ext: []byte(`{"prebid":{"integration": "TestIntegrationType"}}`)},
+			},
+			givenAccount:            &config.Account{DefaultIntegration: "TestDefaultIntegration"},
+			expectedIntegrationType: "TestIntegrationType",
+		},
+		{
+			description: "Request doesn't have request.ext.prebid path, expect default integration value",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{Ext: []byte(``)},
+			},
+			givenAccount:            &config.Account{DefaultIntegration: "TestDefaultIntegration"},
+			expectedIntegrationType: "TestDefaultIntegration",
+		},
+		{
+			description: "Request has blank integration in request, expect default integration value ",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{Ext: []byte(`{"prebid":{"integration": ""}}`)},
+			},
+			givenAccount:            &config.Account{DefaultIntegration: "TestDefaultIntegration"},
+			expectedIntegrationType: "TestDefaultIntegration",
+		},
+	}
+
+	for _, test := range testCases {
+		err := deps.setIntegrationType(test.givenRequestWrapper, test.givenAccount)
+		assert.Empty(t, err, test.description)
+		integrationTypeFromReq, err2 := getIntegrationFromRequest(test.givenRequestWrapper)
+		assert.Empty(t, err2, test.description)
+		assert.Equalf(t, test.expectedIntegrationType, integrationTypeFromReq, "Integration type information isn't correct: %s\n", test.description)
+	}
+}
+
 func TestStoredRequestGenerateUuid(t *testing.T) {
 	uuid := "foo"
 
 	deps := &endpointDeps{
 		fakeUUIDGenerator{id: "foo", err: nil},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -1730,13 +1887,13 @@ func TestStoredRequestGenerateUuid(t *testing.T) {
 			expectedID:             uuid,
 		},
 		{
-			description:            "GenerateRequestID is true, rawData is an app request, has stored bid, and stored bidrequestID is not the macro {{UUID}}, we should generate uuid",
+			description:            "GenerateRequestID is true, rawData is a site request, has stored bid, and stored bidrequestID is not the macro {{UUID}}, we should not generate uuid",
 			givenRawData:           testBidRequests[3],
 			givenGenerateRequestID: true,
-			expectedID:             uuid,
+			expectedID:             "ThisID",
 		},
 		{
-			description:            "GenerateRequestID is false, rawData is an app request and has stored bid, but stored bidrequestID is the macro {{UUID}}, so we should generate uuid",
+			description:            "GenerateRequestID is false, rawData is an app request and has stored bid, and stored bidrequestID is the macro {{UUID}}, so we should generate uuid",
 			givenRawData:           testBidRequests[4],
 			givenGenerateRequestID: false,
 			expectedID:             uuid,
@@ -1754,10 +1911,10 @@ func TestStoredRequestGenerateUuid(t *testing.T) {
 			expectedID:             "ThisID",
 		},
 		{
-			description:            "GenerateRequestID is true, but rawData is a site request, we should not generate uuid",
+			description:            "GenerateRequestID is false, and rawData is a site request, and macro {{UUID}} is present, we should generate uuid",
 			givenRawData:           testBidRequests[1],
-			givenGenerateRequestID: true,
-			expectedID:             "ThisID",
+			givenGenerateRequestID: false,
+			expectedID:             uuid,
 		},
 		{
 			description:            "Macro ID {{UUID}} case sensitivity check meaning a macro that is lowercase {{uuid}} shouldn't generate a uuid",
@@ -1766,16 +1923,9 @@ func TestStoredRequestGenerateUuid(t *testing.T) {
 			expectedID:             "ThisID",
 		},
 		{
-			description:            "Test to check that stored requests are being merged when Macro ID is present with a site rquest",
+			description:            "Test to check that stored requests are being merged properly when UUID isn't being generated",
 			givenRawData:           testBidRequests[5],
 			givenGenerateRequestID: false,
-			expectedID:             "ThisID",
-			expectedCur:            "USD",
-		},
-		{
-			description:            "Test to check that stored requests are being merged when Generate Request ID flag with a site rquest",
-			givenRawData:           testBidRequests[5],
-			givenGenerateRequestID: true,
 			expectedID:             "ThisID",
 			expectedCur:            "USD",
 		},
@@ -1804,7 +1954,7 @@ func TestOversizedRequest(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -1841,7 +1991,7 @@ func TestRequestSizeEdgeCase(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -1877,7 +2027,7 @@ func TestNoEncoding(t *testing.T) {
 	endpoint, _ := NewEndpoint(
 		fakeUUIDGenerator{},
 		&mockExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		&config.Configuration{MaxRequestSize: maxSize},
@@ -1912,11 +2062,14 @@ func TestImplicitAMPNoExt(t *testing.T) {
 		return
 	}
 
-	bidReq := openrtb2.BidRequest{
+	reqWrapper := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{
 		Site: &openrtb2.Site{},
-	}
-	setSiteImplicitly(httpReq, &bidReq)
-	assert.JSONEq(t, `{"amp":0}`, string(bidReq.Site.Ext))
+	}}
+
+	setSiteImplicitly(httpReq, reqWrapper)
+
+	assert.NoError(t, reqWrapper.RebuildRequest())
+	assert.JSONEq(t, `{"amp":0}`, string(reqWrapper.Site.Ext))
 }
 
 func TestImplicitAMPOtherExt(t *testing.T) {
@@ -1925,13 +2078,16 @@ func TestImplicitAMPOtherExt(t *testing.T) {
 		return
 	}
 
-	bidReq := openrtb2.BidRequest{
+	reqWrapper := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{
 		Site: &openrtb2.Site{
 			Ext: json.RawMessage(`{"other":true}`),
 		},
-	}
-	setSiteImplicitly(httpReq, &bidReq)
-	assert.JSONEq(t, `{"amp":0,"other":true}`, string(bidReq.Site.Ext))
+	}}
+
+	setSiteImplicitly(httpReq, reqWrapper)
+
+	assert.NoError(t, reqWrapper.RebuildRequest())
+	assert.JSONEq(t, `{"amp":0,"other":true}`, string(reqWrapper.Site.Ext))
 }
 
 func TestExplicitAMP(t *testing.T) {
@@ -1940,12 +2096,12 @@ func TestExplicitAMP(t *testing.T) {
 		return
 	}
 
-	bidReq := openrtb2.BidRequest{
+	bidReq := &openrtb_ext.RequestWrapper{BidRequest: &openrtb2.BidRequest{
 		Site: &openrtb2.Site{
 			Ext: json.RawMessage(`{"amp":1}`),
 		},
-	}
-	setSiteImplicitly(httpReq, &bidReq)
+	}}
+	setSiteImplicitly(httpReq, bidReq)
 	assert.JSONEq(t, `{"amp":1}`, string(bidReq.Site.Ext))
 }
 
@@ -1954,7 +2110,7 @@ func TestContentType(t *testing.T) {
 	endpoint, _ := NewEndpoint(
 		fakeUUIDGenerator{},
 		&mockExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		&config.Configuration{MaxRequestSize: maxSize},
@@ -2043,7 +2199,7 @@ func TestValidateImpExt(t *testing.T) {
 				{
 					description:    "Disabled Bidder",
 					impExt:         json.RawMessage(`{"disabledbidder":{"foo":"bar"}}`),
-					expectedImpExt: `{}`,
+					expectedImpExt: `{"disabledbidder":{"foo":"bar"}}`,
 					expectedErrs: []error{
 						&errortypes.BidderTemporarilyDisabled{Message: "The bidder 'disabledbidder' has been disabled."},
 						errors.New("request.imp[0].ext must contain at least one bidder"),
@@ -2062,7 +2218,7 @@ func TestValidateImpExt(t *testing.T) {
 				{
 					description:    "Disabled Bidder + First Party Data Context",
 					impExt:         json.RawMessage(`{"disabledbidder":{"foo":"bar"},"context":{"data":{"keywords":"prebid server example"}}}`),
-					expectedImpExt: `{"context":{"data":{"keywords":"prebid server example"}}}`,
+					expectedImpExt: `{"disabledbidder":{"foo":"bar"},"context":{"data":{"keywords":"prebid server example"}}}`,
 					expectedErrs: []error{
 						&errortypes.BidderTemporarilyDisabled{Message: "The bidder 'disabledbidder' has been disabled."},
 						errors.New("request.imp[0].ext must contain at least one bidder"),
@@ -2071,7 +2227,7 @@ func TestValidateImpExt(t *testing.T) {
 				{
 					description:    "Disabled Prebid Ext Bidder + First Party Data Context",
 					impExt:         json.RawMessage(`{"prebid":{"bidder":{"disabledbidder":{"foo":"bar"}}},"context":{"data":{"keywords":"prebid server example"}}}`),
-					expectedImpExt: `{"context":{"data":{"keywords":"prebid server example"}}, "prebid":{"bidder":{"disabledbidder":{"foo":"bar"}}}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"disabledbidder":{"foo":"bar"}}},"context":{"data":{"keywords":"prebid server example"}}}`,
 					expectedErrs: []error{
 						&errortypes.BidderTemporarilyDisabled{Message: "The bidder 'disabledbidder' has been disabled."},
 						errors.New("request.imp[0].ext must contain at least one bidder"),
@@ -2098,7 +2254,7 @@ func TestValidateImpExt(t *testing.T) {
 				{
 					description:    "Valid bidder root ext",
 					impExt:         json.RawMessage(`{"appnexus":{"placement_id":555}}`),
-					expectedImpExt: `{"appnexus":{"placement_id":555}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id":555}}}}`,
 					expectedErrs:   []error{},
 				},
 				{
@@ -2110,7 +2266,7 @@ func TestValidateImpExt(t *testing.T) {
 				{
 					description:    "Valid Bidder + First Party Data Context",
 					impExt:         json.RawMessage(`{"appnexus":{"placement_id":555},"context":{"data":{"keywords":"prebid server example"}}}`),
-					expectedImpExt: `{"appnexus":{"placement_id":555},"context":{"data":{"keywords":"prebid server example"}}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id":555}}},"context":{"data":{"keywords":"prebid server example"}}}`,
 					expectedErrs:   []error{},
 				},
 				{
@@ -2128,13 +2284,13 @@ func TestValidateImpExt(t *testing.T) {
 				{
 					description:    "Valid Bidder + Disabled Bidder",
 					impExt:         json.RawMessage(`{"appnexus":{"placement_id":555},"disabledbidder":{"foo":"bar"}}`),
-					expectedImpExt: `{"appnexus":{"placement_id":555}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id":555}}}}`,
 					expectedErrs:   []error{&errortypes.BidderTemporarilyDisabled{Message: "The bidder 'disabledbidder' has been disabled."}},
 				},
 				{
 					description:    "Valid Bidder + Disabled Bidder + First Party Data Context",
 					impExt:         json.RawMessage(`{"appnexus":{"placement_id":555},"disabledbidder":{"foo":"bar"},"context":{"data":{"keywords":"prebid server example"}}}`),
-					expectedImpExt: `{"appnexus":{"placement_id":555},"context":{"data":{"keywords":"prebid server example"}}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id":555}}},"context":{"data":{"keywords":"prebid server example"}}}`,
 					expectedErrs:   []error{&errortypes.BidderTemporarilyDisabled{Message: "The bidder 'disabledbidder' has been disabled."}},
 				},
 				{
@@ -2146,19 +2302,19 @@ func TestValidateImpExt(t *testing.T) {
 				{
 					description:    "Valid Prebid Ext Bidder + Disabled Bidder Ext",
 					impExt:         json.RawMessage(`{"prebid":{"bidder":{"appnexus":{"placement_id":555},"disabledbidder":{"foo":"bar"}}}}`),
-					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id": 555},"disabledbidder":{"foo":"bar"}}},"appnexus":{"placement_id":555}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id": 555}}}}`,
 					expectedErrs:   []error{&errortypes.BidderTemporarilyDisabled{Message: "The bidder 'disabledbidder' has been disabled."}},
 				},
 				{
 					description:    "Valid Prebid Ext Bidder + Disabled Ext Bidder + First Party Data Context",
 					impExt:         json.RawMessage(`{"prebid":{"bidder":{"appnexus":{"placement_id":555},"disabledbidder":{"foo":"bar"}}},"context":{"data":{"keywords":"prebid server example"}}}`),
-					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id": 555},"disabledbidder":{"foo":"bar"}}},"appnexus":{"placement_id":555},"context":{"data":{"keywords":"prebid server example"}}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id": 555}}},"context":{"data":{"keywords":"prebid server example"}}}`,
 					expectedErrs:   []error{&errortypes.BidderTemporarilyDisabled{Message: "The bidder 'disabledbidder' has been disabled."}},
 				},
 				{
 					description:    "Valid Prebid Ext Bidder + Disabled Ext Bidder + Unknown Ext + First Party Data Context",
 					impExt:         json.RawMessage(`{"prebid":{"bidder":{"appnexus":{"placement_id":555},"disabledbidder":{"foo":"bar"},"unknownbidder":{"placement_id":555}}},"context":{"data":{"keywords":"prebid server example"}}}`),
-					expectedImpExt: `{"context":{"data":{"keywords":"prebid server example"}},"prebid":{"bidder":{"appnexus":{"placement_id":555},"disabledbidder":{"foo":"bar"},"unknownbidder":{"placement_id":555}}}}`,
+					expectedImpExt: `{"prebid":{"bidder":{"appnexus":{"placement_id":555},"disabledbidder":{"foo":"bar"},"unknownbidder":{"placement_id":555}}},"context":{"data":{"keywords":"prebid server example"}}}`,
 					expectedErrs:   []error{errors.New("request.imp[0].ext contains unknown bidder: unknownbidder. Did you forget an alias in request.ext.prebid.aliases?")},
 				},
 			},
@@ -2168,7 +2324,7 @@ func TestValidateImpExt(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -2188,8 +2344,11 @@ func TestValidateImpExt(t *testing.T) {
 	for _, group := range testGroups {
 		for _, test := range group.testCases {
 			imp := &openrtb2.Imp{Ext: test.impExt}
+			impWrapper := &openrtb_ext.ImpWrapper{Imp: imp}
 
-			errs := deps.validateImpExt(imp, nil, 0)
+			errs := deps.validateImpExt(impWrapper, nil, 0, false, nil)
+
+			assert.NoError(t, impWrapper.RebuildImp(), test.description+":rebuild_imp")
 
 			if len(test.expectedImpExt) > 0 {
 				assert.JSONEq(t, test.expectedImpExt, string(imp.Ext), "imp.ext JSON does not match expected. Test: %s. %s\n", group.description, test.description)
@@ -2216,7 +2375,7 @@ func TestCurrencyTrunc(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -2252,7 +2411,7 @@ func TestCurrencyTrunc(t *testing.T) {
 		Cur: []string{"USD", "EUR"},
 	}
 
-	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false)
+	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false, false, nil)
 
 	expectedError := errortypes.Warning{Message: "A prebid request can only process one currency. Taking the first currency in the list, USD, as the active currency"}
 	assert.ElementsMatch(t, errL, []error{&expectedError})
@@ -2262,7 +2421,7 @@ func TestCCPAInvalid(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -2300,7 +2459,7 @@ func TestCCPAInvalid(t *testing.T) {
 		},
 	}
 
-	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false)
+	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false, false, nil)
 
 	expectedWarning := errortypes.Warning{
 		Message:     "CCPA consent is invalid and will be ignored. (request.regs.ext.us_privacy must contain 4 characters)",
@@ -2312,7 +2471,7 @@ func TestNoSaleInvalid(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -2351,7 +2510,7 @@ func TestNoSaleInvalid(t *testing.T) {
 		Ext: json.RawMessage(`{"prebid": {"nosale": ["*", "appnexus"]} }`),
 	}
 
-	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false)
+	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false, false, nil)
 
 	expectedError := errors.New("request.ext.prebid.nosale is invalid: can only specify all bidders if no other bidders are provided")
 	assert.ElementsMatch(t, errL, []error{expectedError})
@@ -2365,7 +2524,7 @@ func TestValidateSourceTID(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -2400,7 +2559,7 @@ func TestValidateSourceTID(t *testing.T) {
 		},
 	}
 
-	deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false)
+	deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false, false, nil)
 	assert.NotEmpty(t, req.Source.TID, "Expected req.Source.TID to be filled with a randomly generated UID")
 }
 
@@ -2408,7 +2567,7 @@ func TestSChainInvalid(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -2444,7 +2603,7 @@ func TestSChainInvalid(t *testing.T) {
 		Ext: json.RawMessage(`{"prebid":{"schains":[{"bidders":["appnexus"],"schain":{"complete":1,"nodes":[{"asi":"directseller1.com","sid":"00001","rid":"BidRequest1","hp":1}],"ver":"1.0"}}, {"bidders":["appnexus"],"schain":{"complete":1,"nodes":[{"asi":"directseller2.com","sid":"00002","rid":"BidRequest2","hp":1}],"ver":"1.0"}}]}}`),
 	}
 
-	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false)
+	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false, false, nil)
 
 	expectedError := errors.New("request.ext.prebid.schains contains multiple schains for bidder appnexus; it must contain no more than one per bidder.")
 	assert.ElementsMatch(t, errL, []error{expectedError})
@@ -2454,13 +2613,13 @@ func TestMapSChains(t *testing.T) {
 	const seller1SChain string = `"schain":{"complete":1,"nodes":[{"asi":"directseller1.com","sid":"00001","rid":"BidRequest1","hp":1}],"ver":"1.0"}`
 	const seller2SChain string = `"schain":{"complete":2,"nodes":[{"asi":"directseller2.com","sid":"00002","rid":"BidRequest2","hp":2}],"ver":"2.0"}`
 
-	seller1SChainUnpacked := openrtb_ext.ExtRequestPrebidSChainSChain{
+	seller1SChainUnpacked := openrtb2.SupplyChain{
 		Complete: 1,
-		Nodes: []*openrtb_ext.ExtRequestPrebidSChainSChainNode{{
+		Nodes: []openrtb2.SupplyChainNode{{
 			ASI: "directseller1.com",
 			SID: "00001",
 			RID: "BidRequest1",
-			HP:  1,
+			HP:  openrtb2.Int8Ptr(1),
 		}},
 		Ver: "1.0",
 	}
@@ -2468,8 +2627,8 @@ func TestMapSChains(t *testing.T) {
 	tests := []struct {
 		description         string
 		bidRequest          openrtb2.BidRequest
-		wantReqExtSChain    *openrtb_ext.ExtRequestPrebidSChainSChain
-		wantSourceExtSChain *openrtb_ext.ExtRequestPrebidSChainSChain
+		wantReqExtSChain    *openrtb2.SupplyChain
+		wantSourceExtSChain *openrtb2.SupplyChain
 		wantError           bool
 	}{
 		{
@@ -2549,31 +2708,31 @@ func TestMapSChains(t *testing.T) {
 		},
 	}
 
-	for _, tt := range tests {
+	for _, test := range tests {
 		reqWrapper := openrtb_ext.RequestWrapper{
-			BidRequest: &tt.bidRequest,
+			BidRequest: &test.bidRequest,
 		}
 
 		err := mapSChains(&reqWrapper)
 
-		if tt.wantError {
-			assert.NotNil(t, err, tt.description)
+		if test.wantError {
+			assert.NotNil(t, err, test.description)
 		} else {
-			assert.Nil(t, err, tt.description)
+			assert.Nil(t, err, test.description)
 
 			reqExt, err := reqWrapper.GetRequestExt()
 			if err != nil {
-				assert.Fail(t, "Error getting request ext from wrapper", tt.description)
+				assert.Fail(t, "Error getting request ext from wrapper", test.description)
 			}
 			reqExtSChain := reqExt.GetSChain()
-			assert.Equal(t, tt.wantReqExtSChain, reqExtSChain, tt.description)
+			assert.Equal(t, test.wantReqExtSChain, reqExtSChain, test.description)
 
 			sourceExt, err := reqWrapper.GetSourceExt()
 			if err != nil {
-				assert.Fail(t, "Error getting source ext from wrapper", tt.description)
+				assert.Fail(t, "Error getting source ext from wrapper", test.description)
 			}
 			sourceExtSChain := sourceExt.GetSChain()
-			assert.Equal(t, tt.wantSourceExtSChain, sourceExtSChain, tt.description)
+			assert.Equal(t, test.wantSourceExtSChain, sourceExtSChain, test.description)
 		}
 	}
 }
@@ -2704,7 +2863,9 @@ func TestSanitizeRequest(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		sanitizeRequest(test.req, test.ipValidator)
+		bidReq := &openrtb_ext.RequestWrapper{BidRequest: test.req}
+
+		sanitizeRequest(bidReq, test.ipValidator)
 		assert.Equal(t, test.expectedIPv4, test.req.Device.IP, test.description+":ipv4")
 		assert.Equal(t, test.expectedIPv6, test.req.Device.IPv6, test.description+":ipv6")
 	}
@@ -2757,7 +2918,7 @@ func TestEidPermissionsInvalid(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&nobidExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -2793,7 +2954,7 @@ func TestEidPermissionsInvalid(t *testing.T) {
 		Ext: json.RawMessage(`{"prebid": {"data": {"eidpermissions": [{"source":"a", "bidders":[]}]} } }`),
 	}
 
-	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false)
+	errL := deps.validateRequest(&openrtb_ext.RequestWrapper{BidRequest: &req}, false, false, nil)
 
 	expectedError := errors.New(`request.ext.prebid.data.eidpermissions[0] missing or empty required field: "bidders"`)
 	assert.ElementsMatch(t, errL, []error{expectedError})
@@ -3010,7 +3171,7 @@ func TestIOS14EndToEnd(t *testing.T) {
 	endpoint, _ := NewEndpoint(
 		fakeUUIDGenerator{},
 		exchange,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		&config.Configuration{MaxRequestSize: maxSize},
@@ -3039,7 +3200,7 @@ func TestAuctionWarnings(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&warningsCheckExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -3080,7 +3241,7 @@ func TestParseRequestParseImpInfoError(t *testing.T) {
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		&warningsCheckExchange{},
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -3099,63 +3260,12 @@ func TestParseRequestParseImpInfoError(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(reqBody))
 
-	resReq, impExtInfoMap, errL := deps.parseRequest(req)
+	resReq, impExtInfoMap, _, _, _, errL := deps.parseRequest(req)
 
 	assert.Nil(t, resReq, "Result request should be nil due to incorrect imp")
 	assert.Nil(t, impExtInfoMap, "Impression info map should be nil due to incorrect imp")
 	assert.Len(t, errL, 1, "One error should be returned")
 	assert.Contains(t, errL[0].Error(), "echovideoattrs of type bool", "Incorrect error message")
-}
-
-func TestAuctionFirstPartyData(t *testing.T) {
-	reqBody := validRequest(t, "first-party-data.json")
-	deps := &endpointDeps{
-		fakeUUIDGenerator{},
-		&mockExchangeFPD{},
-		newParamsValidator(t),
-		&mockStoredReqFetcher{},
-		empty_fetcher.EmptyFetcher{},
-		empty_fetcher.EmptyFetcher{},
-		&config.Configuration{MaxRequestSize: int64(len(reqBody))},
-		&metricsConfig.NilMetricsEngine{},
-		analyticsConf.NewPBSAnalytics(&config.Analytics{}),
-		map[string]string{},
-		false,
-		[]byte{},
-		openrtb_ext.BuildBidderMap(),
-		nil,
-		nil,
-		hardcodedResponseIPValidator{response: true},
-		empty_fetcher.EmptyFetcher{},
-	}
-
-	req := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(reqBody))
-	recorder := httptest.NewRecorder()
-
-	deps.Auction(recorder, req, nil)
-
-	if recorder.Code != http.StatusOK {
-		t.Errorf("Endpoint should return a 200")
-	}
-	resultRequest := deps.ex.(*mockExchangeFPD).lastRequest
-	resultFPD := deps.ex.(*mockExchangeFPD).firstPartyData
-
-	assert.Len(t, resultFPD, 2, "Result FPD length is incorrect")
-
-	assert.NotNil(t, resultFPD[openrtb_ext.BidderName("bidder1")], "Result FPD for bidder1 is incorrect")
-	assert.NotNil(t, resultFPD[openrtb_ext.BidderName("bidder1")].Site, "Result FPD for bidder1.Site is incorrect")
-	assert.Nil(t, resultFPD[openrtb_ext.BidderName("bidder1")].App, "Result FPD for bidder1.App is incorrect")
-	assert.NotNil(t, resultFPD[openrtb_ext.BidderName("bidder1")].User, "Result FPD for bidder1.User is incorrect")
-
-	assert.NotNil(t, resultFPD[openrtb_ext.BidderName("bidder2")], "Result FPD for bidder2 is incorrect")
-	assert.NotNil(t, resultFPD[openrtb_ext.BidderName("bidder2")].Site, "Result FPD for bidder2.Site is incorrect")
-	assert.Nil(t, resultFPD[openrtb_ext.BidderName("bidder2")].App, "Result FPD for bidder2.App is incorrect")
-	assert.NotNil(t, resultFPD[openrtb_ext.BidderName("bidder2")].User, "Result FPD for bidder2.User is incorrect")
-
-	assert.Nil(t, resultRequest.App, "Result request App should be nil")
-	assert.Nil(t, resultRequest.Site.Content.Data, "Result request Site.Content.Data is incorrect")
-	assert.JSONEq(t, string(resultRequest.Site.Ext), `{"amp": 1}`, "Result request Site.Ext is incorrect")
-	assert.Nil(t, resultRequest.User.Ext, "Result request User.Ext is incorrect")
 }
 
 func TestValidateNativeContextTypes(t *testing.T) {
@@ -3607,7 +3717,7 @@ func TestAuctionResponseHeaders(t *testing.T) {
 	endpoint, _ := NewEndpoint(
 		fakeUUIDGenerator{},
 		exchange,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		empty_fetcher.EmptyFetcher{},
 		empty_fetcher.EmptyFetcher{},
 		&config.Configuration{MaxRequestSize: maxSize},
@@ -3632,896 +3742,9 @@ func TestAuctionResponseHeaders(t *testing.T) {
 	}
 }
 
-// warningsCheckExchange is a well-behaved exchange which stores all incoming warnings.
-type warningsCheckExchange struct {
-	auctionRequest exchange.AuctionRequest
-}
-
-func (e *warningsCheckExchange) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	e.auctionRequest = r
-	return nil, nil
-}
-
-// nobidExchange is a well-behaved exchange which always bids "no bid".
-type nobidExchange struct {
-	gotRequest *openrtb2.BidRequest
-}
-
-func (e *nobidExchange) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	e.gotRequest = r.BidRequest
-	return &openrtb2.BidResponse{
-		ID:    r.BidRequest.ID,
-		BidID: "test bid id",
-		NBR:   openrtb2.NoBidReasonCodeUnknownError.Ptr(),
-	}, nil
-}
-
-type mockBidExchange struct {
-	mockBidder mockBidExchangeBidder
-	pbsRates   map[string]map[string]float64
-}
-
-func newMockBidExchange(bidder mockBidExchangeBidder, mockCurrencyConversionRates map[string]map[string]float64) *mockBidExchange {
-	if bidder.BidCurrency == "" {
-		bidder.BidCurrency = "USD"
-	}
-
-	return &mockBidExchange{
-		mockBidder: bidder,
-		pbsRates:   mockCurrencyConversionRates,
-	}
-}
-
-// getAuctionCurrencyRates copies the logic of the exchange package for testing purposes
-func (e *mockBidExchange) getAuctionCurrencyRates(customRates *openrtb_ext.ExtRequestCurrency) currency.Conversions {
-	if customRates == nil {
-		// The timestamp is required for the function signature, but is not used and its
-		// value has no significance in the tests
-		return currency.NewRates(e.pbsRates)
-	}
-
-	usePbsRates := true
-	if customRates.UsePBSRates != nil {
-		usePbsRates = *customRates.UsePBSRates
-	}
-
-	if !usePbsRates {
-		// The timestamp is required for the function signature, but is not used and its
-		// value has no significance in the tests
-		return currency.NewRates(customRates.ConversionRates)
-	}
-
-	// Both PBS and custom rates can be used, check if ConversionRates is not empty
-	if len(customRates.ConversionRates) == 0 {
-		// Custom rates map is empty, use PBS rates only
-		return currency.NewRates(e.pbsRates)
-	}
-
-	// Return an AggregateConversions object that includes both custom and PBS currency rates but will
-	// prioritize custom rates over PBS rates whenever a currency rate is found in both
-	return currency.NewAggregateConversions(currency.NewRates(customRates.ConversionRates), currency.NewRates(e.pbsRates))
-}
-
-// mockBidExchange is a well-behaved exchange that lists the bidders found in every bidRequest.Imp[i].Ext
-// into the bidResponse.Ext to assert the bidder adapters that were not filtered out in the validation process
-func (e *mockBidExchange) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	bidResponse := &openrtb2.BidResponse{
-		ID:    r.BidRequest.ID,
-		BidID: "test bid id",
-		NBR:   openrtb2.NoBidReasonCodeUnknownError.Ptr(),
-	}
-
-	// Use currencies inside r.BidRequest.Cur, if any, and convert currencies if needed
-	if len(r.BidRequest.Cur) == 0 {
-		r.BidRequest.Cur = []string{"USD"}
-	}
-
-	var currencyFrom string = e.mockBidder.getBidCurrency()
-	var conversionRate float64 = 0.00
-	var err error
-
-	var requestExt openrtb_ext.ExtRequest
-	if len(r.BidRequest.Ext) > 0 {
-		if err := json.Unmarshal(r.BidRequest.Ext, &requestExt); err != nil {
-			return nil, fmt.Errorf("request.ext is invalid: %v", err)
-		}
-	}
-
-	conversions := e.getAuctionCurrencyRates(requestExt.Prebid.CurrencyConversions)
-	for _, bidReqCur := range r.BidRequest.Cur {
-		if conversionRate, err = conversions.GetRate(currencyFrom, bidReqCur); err == nil {
-			bidResponse.Cur = bidReqCur
-			break
-		}
-	}
-
-	if conversionRate == 0 {
-		// Can't have bids if there's not even a 1 USD to 1 USD conversion rate
-		return nil, errors.New("Can't produce bid with no valid currency to use or currency conversion to convert to.")
-	}
-
-	if len(r.BidRequest.Imp) > 0 {
-		var SeatBidMap = make(map[string]openrtb2.SeatBid, 0)
-		for _, imp := range r.BidRequest.Imp {
-			var bidderExts map[string]json.RawMessage
-			if err := json.Unmarshal(imp.Ext, &bidderExts); err != nil {
-				return nil, err
-			}
-
-			if rawPrebidExt, ok := bidderExts[openrtb_ext.PrebidExtKey]; ok {
-				var prebidExt openrtb_ext.ExtImpPrebid
-				if err := json.Unmarshal(rawPrebidExt, &prebidExt); err == nil && prebidExt.Bidder != nil {
-					for bidder, ext := range prebidExt.Bidder {
-						if ext == nil {
-							continue
-						}
-
-						bidderExts[bidder] = ext
-					}
-				}
-			}
-
-			for bidderNameOrAlias := range bidderExts {
-				if isBidderToValidate(bidderNameOrAlias) {
-					if val, ok := SeatBidMap[bidderNameOrAlias]; ok {
-						val.Bid = append(val.Bid, openrtb2.Bid{ID: e.mockBidder.getBidId(bidderNameOrAlias)})
-					} else {
-						SeatBidMap[bidderNameOrAlias] = openrtb2.SeatBid{
-							Seat: e.mockBidder.getSeatName(bidderNameOrAlias),
-							Bid: []openrtb2.Bid{
-								{
-									ID:    e.mockBidder.getBidId(bidderNameOrAlias),
-									Price: e.mockBidder.getBidPrice() * conversionRate,
-								},
-							},
-						}
-					}
-				}
-			}
-		}
-		for _, seatBid := range SeatBidMap {
-			bidResponse.SeatBid = append(bidResponse.SeatBid, seatBid)
-		}
-	}
-
-	return bidResponse, nil
-}
-
-type mockBidExchangeBidder struct {
-	BidCurrency string  `json:"currency"`
-	BidPrice    float64 `json:"price"`
-}
-
-func (bidder mockBidExchangeBidder) getBidCurrency() string {
-	return bidder.BidCurrency
-}
-func (bidder mockBidExchangeBidder) getBidPrice() float64 {
-	return bidder.BidPrice
-}
-func (bidder mockBidExchangeBidder) getSeatName(bidderNameOrAlias string) string {
-	return fmt.Sprintf("%s-bids", bidderNameOrAlias)
-}
-func (bidder mockBidExchangeBidder) getBidId(bidderNameOrAlias string) string {
-	return fmt.Sprintf("%s-bid", bidderNameOrAlias)
-}
-
-type brokenExchange struct{}
-
-func (e *brokenExchange) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	return nil, errors.New("Critical, unrecoverable error.")
-}
-
 // StoredRequest testing
 
 // Test stored request data
-
-// Stored Requests
-// first below is valid JSON
-// second below is identical to first but with extra '}' for invalid JSON
-var testStoredRequestData = map[string]json.RawMessage{
-	"1": json.RawMessage(`{"id": "{{UUID}}"}`),
-	"2": json.RawMessage(`{
-		"id": "{{uuid}}",
-		"tmax": 500,
-		"ext": {
-			"prebid": {
-				"targeting": {
-					"pricegranularity": "low"
-				}
-			}
-		}
-	}`),
-	"3": json.RawMessage(`{
-		"tmax": 500,
-				"ext": {
-						"prebid": {
-								"targeting": {
-										"pricegranularity": "low"
-								}
-						}
-				}}
-		}`),
-	"4": json.RawMessage(`{"id": "{{UUID}}", "cur": ["USD"]}`),
-}
-
-// Stored Imp Requests
-// first below has valid JSON but doesn't match schema
-// second below has invalid JSON (missing comma after rubicon accountId entry) but otherwise matches schema
-// third below has valid JSON and matches schema
-var testStoredImpData = map[string]json.RawMessage{
-	"1": json.RawMessage(`{
-			"id": "adUnit1",
-			"ext": {
-				"appnexus": {
-					"placementId": "abc",
-					"position": "above",
-					"reserve": 0.35
-				},
-				"rubicon": {
-					"accountId": "abc"
-				}
-			},
-			"video":{
-				"w":200,
-				"h":300
-			}
-		}`),
-	"2": json.RawMessage(`{
-			"id": "adUnit1",
-			"ext": {
-				"appnexus": {
-					"placementId": "abc",
-					"position": "above",
-					"reserve": 0.35
-				},
-				"rubicon": {
-					"accountId": "abc"
-				}
-			}
-		}`),
-	"7": json.RawMessage(`{
-			"id": "adUnit1",
-			"ext": {
-				"appnexus": {
-					"placementId": 12345678,
-					"position": "above",
-					"reserve": 0.35
-				},
-				"rubicon": {
-					"accountId": 23456789
-					"siteId": 113932,
-					"zoneId": 535510
-				}
-			}
-		}`),
-	"9": json.RawMessage(`{
-"id": "adUnit1",
-			"ext": {
-				"appnexus": {
-					"placementId": 12345678,
-					"position": "above",
-					"reserve": 0.35
-				},
-				"rubicon": {
-					"accountId": 23456789,
-					"siteId": 113932,
-					"zoneId": 535510
-				}
-			}
-		}`),
-	"10": json.RawMessage(`{
-			"ext": {
-				"appnexus": {
-					"placementId": 12345678,
-					"position": "above",
-					"reserve": 0.35
-				}
-			}
-		}`),
-}
-
-// Incoming requests with stored request IDs
-var testStoredRequests = []string{
-	`{
-		"id": "ThisID",
-		"imp": [
-			{
-				"video":{
-					"h":300,
-					"w":200
-				},
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "1"
-						},
-						"options": {
-							"echovideoattrs": true
-						}
-					}
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"cache": {
-					"markup": 1
-				},
-				"targeting": {
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"imp": [
-			{
-				"id": "adUnit2",
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "1"
-						},
-						"options": {
-							"echovideoattrs": true
-						}
-					},
-					"appnexus": {
-						"placementId": "def",
-						"trafficSourceCode": "mysite.com",
-						"reserve": null
-					},
-					"rubicon": null
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"cache": {
-					"markup": 1
-				},
-				"targeting": {
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"imp": [
-			{
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "2"
-						},
-						"options": {
-							"echovideoattrs": false
-						}
-					}
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"storedrequest": {
-					"id": "2"
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"imp": [
-			{
-				"id": "some-static-imp",
-				"video":{
-					"mimes":["video/mp4"]
-				},
-				"ext": {
-					"appnexus": {
-						"placementId": "abc",
-						"position": "below"
-					}
-				}
-			},
-			{
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "1"
-						}
-					}
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"cache": {
-					"markup": 1
-				},
-				"targeting": {
-				}
-			}
-		}
-	}`,
-}
-
-// The expected requests after stored request processing
-var testFinalRequests = []string{
-	`{
-		"id": "ThisID",
-		"imp": [
-			{
-				"video":{
-					"h":300,
-					"w":200
-				},
-				"ext":{
-					"appnexus":{
-						"placementId":"abc",
-						"position":"above",
-						"reserve":0.35
-					},
-					"prebid":{
-						"storedrequest":{
-							"id":"1"
-						},
-					"options":{
-						"echovideoattrs":true
-					}
-				},
-				"rubicon":{
-					"accountId":"abc"
-				}
-			},
-			"id":"adUnit1"
-			}
-		],
-		"ext": {
-			"prebid": {
-				"cache": {
-					"markup": 1
-				},
-				"targeting": {
-			}
-		}
-}
-	}`,
-	`{
-		"id": "ThisID",
-		"imp": [
-			{
-				"video":{
-					"w":200,
-					"h":300
-				},
-				"ext":{
-					"appnexus":{
-						"placementId":"def",
-						"position":"above",
-						"trafficSourceCode":"mysite.com"
-					},
-					"prebid":{
-						"storedrequest":{
-							"id":"1"
-						},
-						"options":{
-							"echovideoattrs":true
-						}
-					}
-				},
-				"id":"adUnit2"
-			}
-		],
-		"ext": {
-			"prebid": {
-				"cache": {
-					"markup": 1
-				},
-				"targeting": {
-				}
-			}
-		}
-	}`,
-	`{
-  		"ext": {
-  		  "prebid": {
-  		    "storedrequest": {
-  		      "id": "2"
-  		    },
-  		    "targeting": {
-  		      "pricegranularity": "low"
-  		    }
-  		  }
-  		},
-  		"id": "ThisID",
-  		"imp": [
-  		  {
-  		    "ext": {
-  		      "appnexus": {
-  		        "placementId": "abc",
-  		        "position": "above",
-  		        "reserve": 0.35
-  		      },
-  		      "prebid": {
-  		        "storedrequest": {
-  		          "id": "2"
-  		        },
-  		        "options":{
-					"echovideoattrs":false
-				}
-  		      },
-  		      "rubicon": {
-  		        "accountId": "abc"
-  		      }
-  		    },
-  		    "id": "adUnit1"
-  		  }
-  		],
-  		"tmax": 500
-	}
-`,
-	`{
-	"id": "ThisID",
-	"imp": [
-		{
-    		"id": "some-static-imp",
-    		"video": {
-    		  "mimes": [
-    		    "video/mp4"
-    		  ]
-    		},
-    		"ext": {
-    		  "appnexus": {
-    		    "placementId": "abc",
-    		    "position": "below"
-    		  }
-    		}
-  		},
-  		{
-  		  "ext": {
-  		    "appnexus": {
-  		      "placementId": "abc",
-  		      "position": "above",
-  		      "reserve": 0.35
-  		    },
-  		    "prebid": {
-  		      "storedrequest": {
-  		        "id": "1"
-  		      }
-  		    },
-  		    "rubicon": {
-  		      "accountId": "abc"
-  		    }
-  		  },
-  		  "id": "adUnit1",
-		  "video":{
-				"w":200,
-				"h":300
-          }
-  		}
-	],
-	"ext": {
-		"prebid": {
-			"cache": {
-				"markup": 1
-			},
-			"targeting": {
-			}
-		}
-	}
-}`,
-}
-
-var testStoredImpIds = []string{
-	"adUnit1", "adUnit2", "adUnit1", "some-static-imp",
-}
-
-var testStoredImps = []string{
-	`{
-		"id": "adUnit1",
-        "ext": {
-        	"appnexus": {
-        		"placementId": "abc",
-        		"position": "above",
-        		"reserve": 0.35
-        	},
-        	"rubicon": {
-        		"accountId": "abc"
-        	}
-        },
-		"video":{
-        	"w":200,
-        	"h":300
-		}
-	}`,
-	`{
-		"id": "adUnit1",
-        "ext": {
-        	"appnexus": {
-        		"placementId": "abc",
-        		"position": "above",
-        		"reserve": 0.35
-        	},
-        	"rubicon": {
-        		"accountId": "abc"
-        	}
-        },
-		"video":{
-        	"w":200,
-        	"h":300
-		}
-	}`,
-	`{
-			"id": "adUnit1",
-			"ext": {
-				"appnexus": {
-					"placementId": "abc",
-					"position": "above",
-					"reserve": 0.35
-				},
-				"rubicon": {
-					"accountId": "abc"
-				}
-			}
-		}`,
-	``,
-}
-
-var testBidRequests = []string{
-	`{
-		"id": "ThisID",
-		"app": {
-			"id": "123"
-		},
-		"imp": [
-			{
-				"video":{
-					"h":300,
-					"w":200
-				},
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "1"
-						},
-						"options": {
-							"echovideoattrs": true
-						}
-					}
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"cache": {
-					"markup": 1
-				},
-				"targeting": {
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"site": {
-			"page": "prebid.org"
-		},
-		"imp": [
-			{
-				"id": "adUnit2",
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "1"
-						},
-						"options": {
-							"echovideoattrs": true
-						}
-					},
-					"appnexus": {
-						"placementId": "def",
-						"trafficSourceCode": "mysite.com",
-						"reserve": null
-					},
-					"rubicon": null
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"targeting": {
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"app": {
-			"id": "123"
-		},
-		"imp": [
-			{
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "2"
-						},
-						"options": {
-							"echovideoattrs": false
-						}
-					}
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"storedrequest": {
-					"id": "2"
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"app": {
-			"id": "123"
-		},
-		"imp": [
-			{
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "2"
-						},
-						"options": {
-							"echovideoattrs": false
-						}
-					}
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"storedrequest": {
-					"id": "2"
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"app": {
-			"id": "123"
-		},
-		"imp": [
-			{
-				"ext": {
-					"prebid": {
-						"storedrequest": {
-							"id": "1"
-						},
-						"options": {
-							"echovideoattrs": false
-						}
-					}
-				}
-			}
-		],
-		"ext": {
-			"prebid": {
-				"storedrequest": {
-					"id": "1"
-				}
-			}
-		}
-	}`,
-	`{
-		"id": "ThisID",
-		"imp": [{
-			"id": "some-impression-id",
-			"banner": {
-				"format": [{
-						"w": 600,
-						"h": 500
-					},
-					{
-						"w": 300,
-						"h": 600
-					}
-				]
-			},
-			"ext": {
-				"appnexus": {
-					"placementId": 12883451
-				}
-			}
-		}],
-		"ext": {
-			"prebid": {
-				"debug": true,
-				"storedrequest": {
-					"id": "4"
-				}
-			}
-		},
-	  "site": {
-		"page": "https://example.com"
-	  }
-	}`,
-}
-
-type mockStoredReqFetcher struct {
-}
-
-func (cf mockStoredReqFetcher) FetchRequests(ctx context.Context, requestIDs []string, impIDs []string) (requestData map[string]json.RawMessage, impData map[string]json.RawMessage, errs []error) {
-	return testStoredRequestData, testStoredImpData, nil
-}
-
-func (cf mockStoredReqFetcher) FetchResponses(ctx context.Context, ids []string) (data map[string]json.RawMessage, errs []error) {
-	return nil, nil
-}
-
-type mockExchange struct {
-	lastRequest *openrtb2.BidRequest
-}
-
-func (m *mockExchange) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	m.lastRequest = r.BidRequest
-	return &openrtb2.BidResponse{
-		SeatBid: []openrtb2.SeatBid{{
-			Bid: []openrtb2.Bid{{
-				AdM: "<script></script>",
-			}},
-		}},
-	}, nil
-}
-
-type mockExchangeFPD struct {
-	lastRequest    *openrtb2.BidRequest
-	firstPartyData map[openrtb_ext.BidderName]*firstpartydata.ResolvedFirstPartyData
-}
-
-func (m *mockExchangeFPD) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	m.lastRequest = r.BidRequest
-	m.firstPartyData = r.FirstPartyData
-	return &openrtb2.BidResponse{}, nil
-}
-
-func getBidderInfos(cfg map[string]config.Adapter, biddersNames []openrtb_ext.BidderName) config.BidderInfos {
-	biddersInfos := make(config.BidderInfos)
-	for _, name := range biddersNames {
-		adapterConfig, ok := cfg[string(name)]
-		if !ok {
-			adapterConfig = config.Adapter{}
-		}
-		biddersInfos[string(name)] = newBidderInfo(adapterConfig)
-	}
-	return biddersInfos
-}
-
-func newBidderInfo(cfg config.Adapter) config.BidderInfo {
-	return config.BidderInfo{
-		Enabled: !cfg.Disabled,
-	}
-}
-
-type hardcodedResponseIPValidator struct {
-	response bool
-}
-
-func (v hardcodedResponseIPValidator) IsValid(net.IP, iputil.IPVersion) bool {
-	return v.response
-}
-
-type fakeUUIDGenerator struct {
-	id  string
-	err error
-}
-
-func (f fakeUUIDGenerator) Generate() (string, error) {
-	return f.id, f.err
-}
 
 func TestValidateBanner(t *testing.T) {
 	impIndex := 0
@@ -4585,17 +3808,17 @@ func TestParseRequestMergeBidderParams(t *testing.T) {
 			expectedErrorCount: 0,
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 
 			deps := &endpointDeps{
 				fakeUUIDGenerator{},
 				&warningsCheckExchange{},
-				newParamsValidator(t),
+				mockBidderParamValidator{},
 				&mockStoredReqFetcher{},
 				empty_fetcher.EmptyFetcher{},
 				empty_fetcher.EmptyFetcher{},
-				&config.Configuration{MaxRequestSize: int64(len(tt.givenRequestBody))},
+				&config.Configuration{MaxRequestSize: int64(len(test.givenRequestBody))},
 				&metricsConfig.NilMetricsEngine{},
 				analyticsConf.NewPBSAnalytics(&config.Analytics{}),
 				map[string]string{},
@@ -4608,12 +3831,14 @@ func TestParseRequestMergeBidderParams(t *testing.T) {
 				empty_fetcher.EmptyFetcher{},
 			}
 
-			req := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(tt.givenRequestBody))
+			req := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(test.givenRequestBody))
 
-			resReq, _, errL := deps.parseRequest(req)
+			resReq, _, _, _, _, errL := deps.parseRequest(req)
+
+			assert.NoError(t, resReq.RebuildRequest())
 
 			var expIExt, iExt map[string]interface{}
-			err := json.Unmarshal(tt.expectedImpExt, &expIExt)
+			err := json.Unmarshal(test.expectedImpExt, &expIExt)
 			assert.Nil(t, err, "unmarshal() should return nil error")
 
 			assert.NotNil(t, resReq.BidRequest.Imp[0].Ext, "imp[0].Ext should not be nil")
@@ -4623,7 +3848,7 @@ func TestParseRequestMergeBidderParams(t *testing.T) {
 			assert.Equal(t, expIExt, iExt, "bidderparams in imp[].Ext should match")
 
 			var eReqE, reqE map[string]interface{}
-			err = json.Unmarshal(tt.expectedReqExt, &eReqE)
+			err = json.Unmarshal(test.expectedReqExt, &eReqE)
 			assert.Nil(t, err, "unmarshal() should return nil error")
 
 			err = json.Unmarshal(resReq.BidRequest.Ext, &reqE)
@@ -4631,9 +3856,761 @@ func TestParseRequestMergeBidderParams(t *testing.T) {
 
 			assert.Equal(t, eReqE, reqE, "req.Ext should match")
 
-			assert.Len(t, errL, tt.expectedErrorCount, "error length should match")
+			assert.Len(t, errL, test.expectedErrorCount, "error length should match")
 		})
 	}
+}
+
+func TestParseRequestStoredResponses(t *testing.T) {
+	mockStoredResponses := map[string]json.RawMessage{
+		"6d718149": json.RawMessage(`[{"bid": [{"id": "bid_id1"],"seat": "appnexus"}]`),
+		"6d715835": json.RawMessage(`[{"bid": [{"id": "bid_id2"],"seat": "appnexus"}]`),
+	}
+
+	tests := []struct {
+		name                    string
+		givenRequestBody        string
+		expectedStoredResponses stored_responses.ImpsWithBidResponses
+		expectedErrorCount      int
+		expectedError           string
+	}{
+		{
+			name:             "req imp has valid stored response",
+			givenRequestBody: validRequest(t, "req-imp-stored-response.json"),
+			expectedStoredResponses: map[string]json.RawMessage{
+				"imp-id1": json.RawMessage(`[{"bid": [{"id": "bid_id1"],"seat": "appnexus"}]`),
+			},
+			expectedErrorCount: 0,
+		},
+		{
+			name:             "req has two imps valid stored responses",
+			givenRequestBody: validRequest(t, "req-two-imps-stored-response.json"),
+			expectedStoredResponses: map[string]json.RawMessage{
+				"imp-id1": json.RawMessage(`[{"bid": [{"id": "bid_id1"],"seat": "appnexus"}]`),
+				"imp-id2": json.RawMessage(`[{"bid": [{"id": "bid_id2"],"seat": "appnexus"}]`),
+			},
+			expectedErrorCount: 0,
+		},
+		{
+			name:             "req has two imps with missing stored responses",
+			givenRequestBody: validRequest(t, "req-two-imps-missing-stored-response.json"),
+			expectedStoredResponses: map[string]json.RawMessage{
+				"imp-id1": json.RawMessage(`[{"bid": [{"id": "bid_id1"],"seat": "appnexus"}]`),
+				"imp-id2": json.RawMessage(nil),
+			},
+			expectedErrorCount: 0,
+		},
+		{
+			name:             "req has two imps: one with stored response and another imp without stored resp",
+			givenRequestBody: validRequest(t, "req-two-imps-one-stored-response.json"),
+			expectedStoredResponses: map[string]json.RawMessage{
+				"imp-id1": json.RawMessage(`[{"bid": [{"id": "bid_id1"],"seat": "appnexus"}]`),
+			},
+			expectedErrorCount: 1,
+			expectedError:      `request validation failed. The StoredAuctionResponse.ID field must be completely present with, or completely absent from, all impressions in request. No StoredAuctionResponse data found for request.imp[1].ext.prebid`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+
+			deps := &endpointDeps{
+				fakeUUIDGenerator{},
+				&warningsCheckExchange{},
+				mockBidderParamValidator{},
+				&mockStoredReqFetcher{},
+				empty_fetcher.EmptyFetcher{},
+				empty_fetcher.EmptyFetcher{},
+				&config.Configuration{MaxRequestSize: int64(len(test.givenRequestBody))},
+				&metricsConfig.NilMetricsEngine{},
+				analyticsConf.NewPBSAnalytics(&config.Analytics{}),
+				map[string]string{},
+				false,
+				[]byte{},
+				openrtb_ext.BuildBidderMap(),
+				nil,
+				nil,
+				hardcodedResponseIPValidator{response: true},
+				&mockStoredResponseFetcher{mockStoredResponses},
+			}
+
+			req := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(test.givenRequestBody))
+
+			_, _, storedResponses, _, _, errL := deps.parseRequest(req)
+
+			if test.expectedErrorCount == 0 {
+				assert.Equal(t, test.expectedStoredResponses, storedResponses, "stored responses should match")
+			} else {
+				assert.Contains(t, errL[0].Error(), test.expectedError, "error should match")
+			}
+
+		})
+	}
+}
+
+func TestParseRequestStoredBidResponses(t *testing.T) {
+	bidRespId1 := json.RawMessage(`{"id": "resp_id1", "seatbid": [{"bid": [{"id": "bid_id1"}], "seat": "testBidder1"}], "bidid": "123", "cur": "USD"}`)
+	bidRespId2 := json.RawMessage(`{"id": "resp_id2", "seatbid": [{"bid": [{"id": "bid_id2"}], "seat": "testBidder2"}], "bidid": "124", "cur": "USD"}`)
+	mockStoredBidResponses := map[string]json.RawMessage{
+		"bidResponseId1": bidRespId1,
+		"bidResponseId2": bidRespId2,
+	}
+
+	tests := []struct {
+		name                       string
+		givenRequestBody           string
+		expectedStoredBidResponses stored_responses.ImpBidderStoredResp
+		expectedErrorCount         int
+		expectedError              string
+	}{
+		{
+			name:             "req imp has valid stored bid response",
+			givenRequestBody: validRequest(t, "imp-with-stored-bid-resp.json"),
+			expectedStoredBidResponses: map[string]map[string]json.RawMessage{
+				"imp-id1": {"testBidder1": bidRespId1},
+			},
+			expectedErrorCount: 0,
+		},
+		{
+			name:             "req has two imps with valid stored bid responses",
+			givenRequestBody: validRequest(t, "req-two-imps-stored-bid-responses.json"),
+			expectedStoredBidResponses: map[string]map[string]json.RawMessage{
+				"imp-id1": {"testBidder1": bidRespId1},
+				"imp-id2": {"testBidder2": bidRespId2},
+			},
+			expectedErrorCount: 0,
+		},
+		{
+			name:             "req has two imps one with valid stored bid responses and another one without stored bid responses",
+			givenRequestBody: validRequest(t, "req-two-imps-with-and-without-stored-bid-responses.json"),
+			expectedStoredBidResponses: map[string]map[string]json.RawMessage{
+				"imp-id2": {"testBidder2": bidRespId2},
+			},
+			expectedErrorCount: 0,
+		},
+		{
+			name:             "req has two imps with missing stored bid responses",
+			givenRequestBody: validRequest(t, "req-two-imps-missing-stored-bid-response.json"),
+			expectedStoredBidResponses: map[string]map[string]json.RawMessage{
+				"imp-id1": {"testBidder1": nil},
+				"imp-id2": {"testBidder2": nil},
+			},
+			expectedErrorCount: 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+
+			deps := &endpointDeps{
+				fakeUUIDGenerator{},
+				&warningsCheckExchange{},
+				mockBidderParamValidator{},
+				&mockStoredReqFetcher{},
+				empty_fetcher.EmptyFetcher{},
+				empty_fetcher.EmptyFetcher{},
+				&config.Configuration{MaxRequestSize: int64(len(test.givenRequestBody))},
+				&metricsConfig.NilMetricsEngine{},
+				analyticsConf.NewPBSAnalytics(&config.Analytics{}),
+				map[string]string{},
+				false,
+				[]byte{},
+				map[string]openrtb_ext.BidderName{"testBidder1": "testBidder1", "testBidder2": "testBidder2"},
+				nil,
+				nil,
+				hardcodedResponseIPValidator{response: true},
+				&mockStoredResponseFetcher{mockStoredBidResponses},
+			}
+
+			req := httptest.NewRequest("POST", "/openrtb2/auction", strings.NewReader(test.givenRequestBody))
+			_, _, _, storedBidResponses, _, errL := deps.parseRequest(req)
+
+			if test.expectedErrorCount == 0 {
+				assert.Equal(t, test.expectedStoredBidResponses, storedBidResponses, "stored responses should match")
+			} else {
+				assert.Contains(t, errL[0].Error(), test.expectedError, "error should match")
+			}
+		})
+	}
+}
+
+func TestValidateStoredResp(t *testing.T) {
+	deps := &endpointDeps{
+		fakeUUIDGenerator{},
+		&nobidExchange{},
+		mockBidderParamValidator{},
+		&mockStoredReqFetcher{},
+		empty_fetcher.EmptyFetcher{},
+		empty_fetcher.EmptyFetcher{},
+		&config.Configuration{MaxRequestSize: maxSize},
+		&metricsConfig.NilMetricsEngine{},
+		analyticsConf.NewPBSAnalytics(&config.Analytics{}),
+		map[string]string{},
+		false,
+		[]byte{},
+		openrtb_ext.BuildBidderMap(),
+		nil,
+		nil,
+		hardcodedResponseIPValidator{response: true},
+		&mockStoredResponseFetcher{},
+	}
+
+	testCases := []struct {
+		description               string
+		givenRequestWrapper       *openrtb_ext.RequestWrapper
+		expectedErrorList         []error
+		hasStoredAuctionResponses bool
+		storedBidResponses        stored_responses.ImpBidderStoredResp
+	}{
+		{
+			description: "One imp with stored response, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus":{"placementId": 12345678}, "prebid": {"storedAuctionResponse": {"id": "6d718149-6dfe-25ae-a7d6-305399f77f04"}}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: true,
+			storedBidResponses:        nil,
+		},
+		{
+			description: "Two imps with stored responses, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus":{"placementId": 12345678}, "prebid": {"storedAuctionResponse": {"id": "6d718149-6dfe-25ae-a7d6-305399f77f04"}}}`),
+						},
+						{
+							ID: "Some-Imp-ID2",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus":{"placementId": 12345678}, "prebid": {"storedAuctionResponse": {"id": "6d718149-6dfe-25ae-a7d6-305399f77f04"}}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: true,
+			storedBidResponses:        nil,
+		},
+		{
+			description: "Two imps, one with stored response, expect validate request to throw validation error",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus":{"placementId": 12345678}, "prebid": {"storedAuctionResponse": {"id": "6d718149-6dfe-25ae-a7d6-305399f77f04"}}}`),
+						},
+						{
+							ID: "Some-Imp-ID2",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus":{"placementId": 12345678}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{errors.New("request validation failed. The StoredAuctionResponse.ID field must be completely present with, or completely absent from, all impressions in request. No StoredAuctionResponse data found for request.imp[1].ext.prebid \n")},
+			hasStoredAuctionResponses: true,
+			storedBidResponses:        nil,
+		},
+		{
+			description: "One imp with stored bid response and corresponding bidder in imp.ext, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "prebid": {"storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "One imp with 2 stored bid responses and 2 corresponding bidders in imp.ext, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "telaria": {"seatCode": "12345678"}, "prebid": {"storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`), "telaria": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "Two imps, one with 2 stored bid responses and 2 corresponding bidders in imp.ext, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "telaria": {"seatCode": "12345678"}, "prebid": {"storedbidresponse": []}}`),
+						},
+						{
+							ID: "Some-Imp-ID2",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "telaria": {"seatCode": "12345678"}, "prebid": {"storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`), "telaria": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "Two imps, both with 2 stored bid responses and 2 corresponding bidders in imp.ext, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "telaria": {"seatCode": "12345678"}, "prebid": {"storedbidresponse": []}}`),
+						},
+						{
+							ID: "Some-Imp-ID2",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "telaria": {"seatCode": "12345678"}, "prebid": {"storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: false,
+			storedBidResponses: stored_responses.ImpBidderStoredResp{
+				"Some-Imp-ID":  {"appnexus": json.RawMessage(`{"test":true}`), "telaria": json.RawMessage(`{"test":true}`)},
+				"Some-Imp-ID1": {"appnexus": json.RawMessage(`{"test":true}`), "telaria": json.RawMessage(`{"test":true}`)},
+			},
+		},
+		{
+			description: "One imp with 2 stored bid responses and 1 bidder in imp.ext, expect validate request to throw an errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "prebid": {"storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{errors.New("request validation failed. Stored bid responses are specified for imp Some-Imp-ID. Bidders specified in imp.ext should match with bidders specified in imp.ext.prebid.storedbidresponse")},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`), "telaria": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "One imp with 1 stored bid responses and 2 bidders in imp.ext, expect validate request to throw an errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "telaria": {"seatCode": "12345678"}, "prebid": {"storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{errors.New("request validation failed. Stored bid responses are specified for imp Some-Imp-ID. Bidders specified in imp.ext should match with bidders specified in imp.ext.prebid.storedbidresponse")},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "One imp with 2 stored bid responses and 2 different bidders in imp.ext, expect validate request to throw an errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "telaria": {"seatCode": "12345678"}, "prebid": {"storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{errors.New("request validation failed. Stored bid responses are specified for imp Some-Imp-ID. Bidders specified in imp.ext should match with bidders specified in imp.ext.prebid.storedbidresponse")},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`), "rubicon": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "One imp with 2 stored bid responses and 1 bidders in imp.ext and 1 in imp.ext.prebid.bidder, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "prebid": {"bidder":{"telaria": {"seatCode": "12345678"}}, "storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`), "telaria": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "One imp with 2 stored bid responses and 1 bidders in imp.ext and 1 in imp.ext.prebid.bidder that is not defined in stored bid responses, expect validate request to throw an error",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"appnexus": {"placementId": 12345678}, "prebid": {"bidder":{"rubicon": {"seatCode": "12345678"}}, "storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{errors.New("request validation failed. Stored bid responses are specified for imp Some-Imp-ID. Bidders specified in imp.ext should match with bidders specified in imp.ext.prebid.storedbidresponse")},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`), "telaria": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "One imp with 1 stored bid response and 1 in imp.ext.prebid.bidder that is defined in stored bid responses, expect validate request to throw no errors",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"prebid": {"bidder":{"telaria": {"seatCode": "12345678"}}, "storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"telaria": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "One imp with 1 stored bid response and 1 in imp.ext.prebid.bidder that is not defined in stored bid responses, expect validate request to throw an error",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"prebid": {"bidder":{"telaria": {"seatCode": "12345678"}}, "storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{errors.New("request validation failed. Stored bid responses are specified for imp Some-Imp-ID. Bidders specified in imp.ext should match with bidders specified in imp.ext.prebid.storedbidresponse")},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID": {"appnexus": json.RawMessage(`{"test":true}`)}},
+		},
+		{
+			description: "2 imps, one imp without stored responses, another imp with 1 stored bid response and 1 in imp.ext.prebid.bidder that is not defined in stored bid responses, expect validate request to throw an error",
+			givenRequestWrapper: &openrtb_ext.RequestWrapper{
+				BidRequest: &openrtb2.BidRequest{
+					ID:  "Some-ID",
+					App: &openrtb2.App{},
+					Imp: []openrtb2.Imp{
+						{
+							ID: "Some-Imp-ID",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"prebid": {"bidder":{"telaria": {"seatCode": "12345678"}}}}`),
+						},
+						{
+							ID: "Some-Imp-ID2",
+							Banner: &openrtb2.Banner{
+								Format: []openrtb2.Format{
+									{
+										W: 600,
+										H: 500,
+									},
+									{
+										W: 300,
+										H: 600,
+									},
+								},
+							},
+							Ext: []byte(`{"prebid": {"bidder":{"telaria": {"seatCode": "12345678"}}, "storedbidresponse": []}}`),
+						},
+					},
+				},
+			},
+			expectedErrorList:         []error{errors.New("request validation failed. Stored bid responses are specified for imp Some-Imp-ID2. Bidders specified in imp.ext should match with bidders specified in imp.ext.prebid.storedbidresponse")},
+			hasStoredAuctionResponses: false,
+			storedBidResponses:        stored_responses.ImpBidderStoredResp{"Some-Imp-ID2": {"appnexus": json.RawMessage(`{"test":true}`)}},
+		},
+	}
+
+	for _, test := range testCases {
+		errorList := deps.validateRequest(test.givenRequestWrapper, false, test.hasStoredAuctionResponses, test.storedBidResponses)
+		assert.Equalf(t, test.expectedErrorList, errorList, "Error doesn't match: %s\n", test.description)
+	}
+}
+
+type mockStoredResponseFetcher struct {
+	data map[string]json.RawMessage
+}
+
+func (cf *mockStoredResponseFetcher) FetchRequests(ctx context.Context, requestIDs []string, impIDs []string) (requestData map[string]json.RawMessage, impData map[string]json.RawMessage, errs []error) {
+	return nil, nil, nil
+}
+
+func (cf *mockStoredResponseFetcher) FetchResponses(ctx context.Context, ids []string) (data map[string]json.RawMessage, errs []error) {
+	return cf.data, nil
 }
 
 func getObject(t *testing.T, filename, key string) json.RawMessage {
@@ -4650,4 +4627,13 @@ func getObject(t *testing.T, filename, key string) json.RawMessage {
 		t.Fatalf("Failed to fetch object with key '%s' ... got error: %v", key, err)
 	}
 	return obj
+}
+
+func getIntegrationFromRequest(req *openrtb_ext.RequestWrapper) (string, error) {
+	reqExt, err := req.GetRequestExt()
+	if err != nil {
+		return "", err
+	}
+	reqPrebid := reqExt.GetPrebid()
+	return reqPrebid.Integration, nil
 }

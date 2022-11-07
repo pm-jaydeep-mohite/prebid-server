@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/text/currency"
 
-	"github.com/mxmCherry/openrtb/v15/openrtb2"
+	"github.com/prebid/openrtb/v17/openrtb2"
 	"github.com/prebid/prebid-server/adapters"
 	"github.com/prebid/prebid-server/config"
 	"github.com/prebid/prebid-server/errortypes"
@@ -26,7 +26,7 @@ type YieldlabAdapter struct {
 }
 
 // Builder builds a new instance of the Yieldlab adapter for the given bidder with the given config.
-func Builder(bidderName openrtb_ext.BidderName, config config.Adapter) (adapters.Bidder, error) {
+func Builder(bidderName openrtb_ext.BidderName, config config.Adapter, server config.Server) (adapters.Bidder, error) {
 	bidder := &YieldlabAdapter{
 		endpoint:    config.Endpoint,
 		cacheBuster: defaultCacheBuster,
@@ -48,6 +48,10 @@ func (a *YieldlabAdapter) makeEndpointURL(req *openrtb2.BidRequest, params *open
 	q.Set("pvid", "true")
 	q.Set("ts", a.cacheBuster())
 	q.Set("t", a.makeTargetingValues(params))
+
+	if hasFormats, formats := a.makeFormats(req); hasFormats {
+		q.Set("sizes", formats)
+	}
 
 	if req.User != nil && req.User.BuyerUID != "" {
 		q.Set("ids", "ylid:"+req.User.BuyerUID)
@@ -76,8 +80,10 @@ func (a *YieldlabAdapter) makeEndpointURL(req *openrtb2.BidRequest, params *open
 	if err != nil {
 		return "", err
 	}
-	if gdpr != "" && consent != "" {
+	if gdpr != "" {
 		q.Set("gdpr", gdpr)
+	}
+	if consent != "" {
 		q.Set("consent", consent)
 	}
 
@@ -86,18 +92,26 @@ func (a *YieldlabAdapter) makeEndpointURL(req *openrtb2.BidRequest, params *open
 	return uri.String(), nil
 }
 
-func (a *YieldlabAdapter) getGDPR(request *openrtb2.BidRequest) (string, string, error) {
-	gdpr := ""
-	var extRegs openrtb_ext.ExtRegs
-	if request.Regs != nil {
-		if err := json.Unmarshal(request.Regs.Ext, &extRegs); err != nil {
-			return "", "", fmt.Errorf("failed to parse ExtRegs in Yieldlab GDPR check: %v", err)
+func (a *YieldlabAdapter) makeFormats(req *openrtb2.BidRequest) (bool, string) {
+	var formats []string
+	const sizesSeparator, adslotSizesSeparator = "|", ","
+	for _, impression := range req.Imp {
+		if !impIsTypeBannerOnly(impression) {
+			continue
 		}
-		if extRegs.GDPR != nil && (*extRegs.GDPR == 0 || *extRegs.GDPR == 1) {
-			gdpr = strconv.Itoa(int(*extRegs.GDPR))
-		}
-	}
 
+		var formatsPerAdslot []string
+		for _, format := range impression.Banner.Format {
+			formatsPerAdslot = append(formatsPerAdslot, fmt.Sprintf("%dx%d", format.W, format.H))
+		}
+		adslotID := a.extractAdslotID(impression)
+		sizesForAdslot := strings.Join(formatsPerAdslot, sizesSeparator)
+		formats = append(formats, fmt.Sprintf("%s:%s", adslotID, sizesForAdslot))
+	}
+	return len(formats) != 0, strings.Join(formats, adslotSizesSeparator)
+}
+
+func (a *YieldlabAdapter) getGDPR(request *openrtb2.BidRequest) (string, string, error) {
 	consent := ""
 	if request.User != nil && request.User.Ext != nil {
 		var extUser openrtb_ext.ExtUser
@@ -105,6 +119,16 @@ func (a *YieldlabAdapter) getGDPR(request *openrtb2.BidRequest) (string, string,
 			return "", "", fmt.Errorf("failed to parse ExtUser in Yieldlab GDPR check: %v", err)
 		}
 		consent = extUser.Consent
+	}
+
+	gdpr := ""
+	var extRegs openrtb_ext.ExtRegs
+	if request.Regs != nil {
+		if err := json.Unmarshal(request.Regs.Ext, &extRegs); err == nil {
+			if extRegs.GDPR != nil && (*extRegs.GDPR == 0 || *extRegs.GDPR == 1) {
+				gdpr = strconv.Itoa(int(*extRegs.GDPR))
+			}
+		}
 	}
 
 	return gdpr, consent, nil
@@ -338,4 +362,9 @@ func splitSize(size string) (uint64, uint64, error) {
 
 	return width, height, nil
 
+}
+
+// impIsTypeBannerOnly returns true if impression is only from type banner. Mixed typed with banner would also result in false.
+func impIsTypeBannerOnly(impression openrtb2.Imp) bool {
+	return impression.Banner != nil && impression.Audio == nil && impression.Video == nil && impression.Native == nil
 }

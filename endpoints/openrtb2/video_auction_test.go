@@ -14,6 +14,7 @@ import (
 	"github.com/prebid/prebid-server/analytics"
 	analyticsConf "github.com/prebid/prebid-server/analytics/config"
 	"github.com/prebid/prebid-server/config"
+	"github.com/prebid/prebid-server/errortypes"
 	"github.com/prebid/prebid-server/exchange"
 	"github.com/prebid/prebid-server/metrics"
 	metricsConfig "github.com/prebid/prebid-server/metrics/config"
@@ -21,7 +22,8 @@ import (
 	"github.com/prebid/prebid-server/prebid_cache_client"
 	"github.com/prebid/prebid-server/stored_requests/backends/empty_fetcher"
 
-	"github.com/mxmCherry/openrtb/v15/openrtb2"
+	"github.com/prebid/openrtb/v17/adcom1"
+	"github.com/prebid/openrtb/v17/openrtb2"
 	gometrics "github.com/rcrowley/go-metrics"
 	"github.com/stretchr/testify/assert"
 )
@@ -335,9 +337,7 @@ func TestVideoEndpointValidationsPositive(t *testing.T) {
 	mimes = append(mimes, "mp4")
 	mimes = append(mimes, "")
 
-	videoProtocols := make([]openrtb2.Protocol, 0)
-	videoProtocols = append(videoProtocols, 15)
-	videoProtocols = append(videoProtocols, 30)
+	videoProtocols := []adcom1.MediaCreativeSubtype{15, 30}
 
 	req := openrtb_ext.BidRequestVideo{
 		StoredRequestId: "123",
@@ -378,7 +378,7 @@ func TestVideoEndpointValidationsCritical(t *testing.T) {
 	mimes = append(mimes, "")
 	mimes = append(mimes, "")
 
-	videoProtocols := make([]openrtb2.Protocol, 0)
+	videoProtocols := []adcom1.MediaCreativeSubtype{}
 
 	req := openrtb_ext.BidRequestVideo{
 		StoredRequestId: "",
@@ -447,9 +447,7 @@ func TestVideoEndpointValidationsPodErrors(t *testing.T) {
 	mimes = append(mimes, "mp4")
 	mimes = append(mimes, "")
 
-	videoProtocols := make([]openrtb2.Protocol, 0)
-	videoProtocols = append(videoProtocols, 15)
-	videoProtocols = append(videoProtocols, 30)
+	videoProtocols := []adcom1.MediaCreativeSubtype{15, 30}
 
 	req := openrtb_ext.BidRequestVideo{
 		StoredRequestId: "123",
@@ -517,9 +515,7 @@ func TestVideoEndpointValidationsSiteAndApp(t *testing.T) {
 	mimes = append(mimes, "mp4")
 	mimes = append(mimes, "")
 
-	videoProtocols := make([]openrtb2.Protocol, 0)
-	videoProtocols = append(videoProtocols, 15)
-	videoProtocols = append(videoProtocols, 30)
+	videoProtocols := []adcom1.MediaCreativeSubtype{15, 30}
 
 	req := openrtb_ext.BidRequestVideo{
 		StoredRequestId: "123",
@@ -575,9 +571,7 @@ func TestVideoEndpointValidationsSiteMissingRequiredField(t *testing.T) {
 	mimes = append(mimes, "mp4")
 	mimes = append(mimes, "")
 
-	videoProtocols := make([]openrtb2.Protocol, 0)
-	videoProtocols = append(videoProtocols, 15)
-	videoProtocols = append(videoProtocols, 30)
+	videoProtocols := []adcom1.MediaCreativeSubtype{15, 30}
 
 	req := openrtb_ext.BidRequestVideo{
 		StoredRequestId: "123",
@@ -817,30 +811,77 @@ func TestMergeOpenRTBToVideoRequest(t *testing.T) {
 }
 
 func TestHandleError(t *testing.T) {
-	vo := analytics.VideoObject{
-		Status: 200,
-		Errors: make([]error, 0),
+	tests := []struct {
+		description       string
+		giveErrors        []error
+		wantCode          int
+		wantMetricsStatus metrics.RequestStatus
+	}{
+		{
+			description: "Blocked account - return 503 with blocked metrics status",
+			giveErrors: []error{
+				&errortypes.BlacklistedAcct{},
+			},
+			wantCode:          503,
+			wantMetricsStatus: metrics.RequestStatusBlacklisted,
+		},
+		{
+			description: "Blocked app - return 503 with blocked metrics status",
+			giveErrors: []error{
+				&errortypes.BlacklistedApp{},
+			},
+			wantCode:          503,
+			wantMetricsStatus: metrics.RequestStatusBlacklisted,
+		},
+		{
+			description: "Account required error - return 400 with bad input metrics status",
+			giveErrors: []error{
+				&errortypes.AcctRequired{},
+			},
+			wantCode:          400,
+			wantMetricsStatus: metrics.RequestStatusBadInput,
+		},
+		{
+			description: "Malformed account config error - return 500 with account config error metrics status",
+			giveErrors: []error{
+				&errortypes.MalformedAcct{},
+			},
+			wantCode:          500,
+			wantMetricsStatus: metrics.RequestStatusAccountConfigErr,
+		},
+		{
+			description: "Multiple generic errors - return 500 with generic error metrics status",
+			giveErrors: []error{
+				errors.New("Error for testing handleError 1"),
+				errors.New("Error for testing handleError 2"),
+			},
+			wantCode:          500,
+			wantMetricsStatus: metrics.RequestStatusErr,
+		},
 	}
 
-	labels := metrics.Labels{
-		Source:        metrics.DemandUnknown,
-		RType:         metrics.ReqTypeVideo,
-		PubID:         metrics.PublisherUnknown,
-		CookieFlag:    metrics.CookieFlagUnknown,
-		RequestStatus: metrics.RequestStatusOK,
+	for _, tt := range tests {
+		vo := analytics.VideoObject{
+			Status: 200,
+			Errors: make([]error, 0),
+		}
+
+		labels := metrics.Labels{
+			Source:        metrics.DemandUnknown,
+			RType:         metrics.ReqTypeVideo,
+			PubID:         metrics.PublisherUnknown,
+			CookieFlag:    metrics.CookieFlagUnknown,
+			RequestStatus: metrics.RequestStatusOK,
+		}
+
+		recorder := httptest.NewRecorder()
+		handleError(&labels, recorder, tt.giveErrors, &vo, nil)
+
+		assert.Equal(t, tt.wantMetricsStatus, labels.RequestStatus, tt.description)
+		assert.Equal(t, tt.wantCode, recorder.Code, tt.description)
+		assert.Equal(t, tt.wantCode, vo.Status, tt.description)
+		assert.ElementsMatch(t, tt.giveErrors, vo.Errors, tt.description)
 	}
-
-	recorder := httptest.NewRecorder()
-	err1 := errors.New("Error for testing handleError 1")
-	err2 := errors.New("Error for testing handleError 2")
-	handleError(&labels, recorder, []error{err1, err2}, &vo, nil)
-
-	assert.Equal(t, metrics.RequestStatusErr, labels.RequestStatus, "labels.RequestStatus should indicate an error")
-	assert.Equal(t, 500, recorder.Code, "Error status should be written to writer")
-	assert.Equal(t, 500, vo.Status, "Analytics object should have error status")
-	assert.Equal(t, 2, len(vo.Errors), "New errors should be appended to Analytics object Errors")
-	assert.Equal(t, "Error for testing handleError 1", vo.Errors[0].Error(), "Error in Analytics object should have test error message for first error")
-	assert.Equal(t, "Error for testing handleError 2", vo.Errors[1].Error(), "Error in Analytics object should have test error message for second error")
 }
 
 func TestHandleErrorMetrics(t *testing.T) {
@@ -998,25 +1039,25 @@ func TestCreateImpressionTemplate(t *testing.T) {
 
 	imp := openrtb2.Imp{}
 	imp.Video = &openrtb2.Video{}
-	imp.Video.Protocols = []openrtb2.Protocol{1, 2}
+	imp.Video.Protocols = []adcom1.MediaCreativeSubtype{1, 2}
 	imp.Video.MIMEs = []string{"video/mp4"}
 	imp.Video.H = 200
 	imp.Video.W = 400
-	imp.Video.PlaybackMethod = []openrtb2.PlaybackMethod{5, 6}
+	imp.Video.PlaybackMethod = []adcom1.PlaybackMethod{5, 6}
 
 	video := openrtb2.Video{}
-	video.Protocols = []openrtb2.Protocol{3, 4}
+	video.Protocols = []adcom1.MediaCreativeSubtype{3, 4}
 	video.MIMEs = []string{"video/flv"}
 	video.H = 300
 	video.W = 0
-	video.PlaybackMethod = []openrtb2.PlaybackMethod{7, 8}
+	video.PlaybackMethod = []adcom1.PlaybackMethod{7, 8}
 
 	res := createImpressionTemplate(imp, &video)
-	assert.Equal(t, res.Video.Protocols, []openrtb2.Protocol{3, 4}, "Incorrect video protocols")
+	assert.Equal(t, res.Video.Protocols, []adcom1.MediaCreativeSubtype{3, 4}, "Incorrect video protocols")
 	assert.Equal(t, res.Video.MIMEs, []string{"video/flv"}, "Incorrect video MIMEs")
 	assert.Equal(t, int(res.Video.H), 300, "Incorrect video height")
 	assert.Equal(t, int(res.Video.W), 0, "Incorrect video width")
-	assert.Equal(t, res.Video.PlaybackMethod, []openrtb2.PlaybackMethod{7, 8}, "Incorrect video playback method")
+	assert.Equal(t, res.Video.PlaybackMethod, []adcom1.PlaybackMethod{7, 8}, "Incorrect video playback method")
 }
 
 func TestCCPA(t *testing.T) {
@@ -1180,10 +1221,10 @@ func mockDepsWithMetrics(t *testing.T, ex *mockExchangeVideo) (*endpointDeps, *m
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		ex,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockVideoStoredReqFetcher{},
 		&mockVideoStoredReqFetcher{},
-		empty_fetcher.EmptyFetcher{},
+		&mockAccountFetcher{data: mockVideoAccountData},
 		&config.Configuration{MaxRequestSize: maxSize},
 		metrics,
 		mockModule,
@@ -1224,10 +1265,10 @@ func mockDeps(t *testing.T, ex *mockExchangeVideo) *endpointDeps {
 	return &endpointDeps{
 		fakeUUIDGenerator{},
 		ex,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockVideoStoredReqFetcher{},
 		&mockVideoStoredReqFetcher{},
-		empty_fetcher.EmptyFetcher{},
+		&mockAccountFetcher{data: mockVideoAccountData},
 		&config.Configuration{MaxRequestSize: maxSize},
 		&metricsConfig.NilMetricsEngine{},
 		analyticsConf.NewPBSAnalytics(&config.Analytics{}),
@@ -1246,7 +1287,7 @@ func mockDepsAppendBidderNames(t *testing.T, ex *mockExchangeAppendBidderNames) 
 	deps := &endpointDeps{
 		fakeUUIDGenerator{},
 		ex,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockVideoStoredReqFetcher{},
 		&mockVideoStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -1270,7 +1311,7 @@ func mockDepsNoBids(t *testing.T, ex *mockExchangeVideoNoBids) *endpointDeps {
 	edep := &endpointDeps{
 		fakeUUIDGenerator{},
 		ex,
-		newParamsValidator(t),
+		mockBidderParamValidator{},
 		&mockVideoStoredReqFetcher{},
 		&mockVideoStoredReqFetcher{},
 		empty_fetcher.EmptyFetcher{},
@@ -1322,7 +1363,7 @@ type mockExchangeVideo struct {
 }
 
 func (m *mockExchangeVideo) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	m.lastRequest = r.BidRequest
+	m.lastRequest = r.BidRequestWrapper.BidRequest
 	if debugLog != nil && debugLog.Enabled {
 		m.cache.called = true
 	}
@@ -1358,7 +1399,7 @@ type mockExchangeAppendBidderNames struct {
 }
 
 func (m *mockExchangeAppendBidderNames) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	m.lastRequest = r.BidRequest
+	m.lastRequest = r.BidRequestWrapper.BidRequest
 	if debugLog != nil && debugLog.Enabled {
 		m.cache.called = true
 	}
@@ -1394,10 +1435,16 @@ type mockExchangeVideoNoBids struct {
 }
 
 func (m *mockExchangeVideoNoBids) HoldAuction(ctx context.Context, r exchange.AuctionRequest, debugLog *exchange.DebugLog) (*openrtb2.BidResponse, error) {
-	m.lastRequest = r.BidRequest
+	m.lastRequest = r.BidRequestWrapper.BidRequest
 	return &openrtb2.BidResponse{
 		SeatBid: []openrtb2.SeatBid{{}},
 	}, nil
+}
+
+var mockVideoAccountData = map[string]json.RawMessage{
+	"valid_acct":     json.RawMessage(`{"disabled":false}`),
+	"disabled_acct":  json.RawMessage(`{"disabled":true}`),
+	"malformed_acct": json.RawMessage(`{"disabled":"invalid type"}`),
 }
 
 var testVideoStoredImpData = map[string]json.RawMessage{
